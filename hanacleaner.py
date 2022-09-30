@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 import sys, os, time, subprocess, re
 from difflib import Differ
+import signal
 
 def printHelp():
     print("                                                                                                                                   ")    
@@ -2030,8 +2031,8 @@ def printHelp():
     print("         Note: Conceptual -tc is the same as -tf, but -tc is using ALTER SYSTEM CLEAR TRACES ... See SQL Ref. for more info.       ")
     print("         Note: there is a bug (fixed with rev.122.11) that could cause younger trace files to be removed.                          ")
     print("         Note: expensive statements are not included in -tc, see -te below                                                         ")
-    print(" -te     retention days for expensive statement files [days], same as for -tc, but only for expensive statement files, only use    ")  #internal incident 1980358670  
-    print("         if you read and understood SAP Note 2819941 (should probably only be used with use_in_memory_tracking = false),           ")  #My opinion: this is a BUG!!
+    print(" -te     retention days for expensive statement files [days], same as for -tc, but only for expensive statement files, only use    ")  #BUG --> https://jira.tools.sap/browse/HDBKERNEL-7797  
+    print("         if you read and understood SAP Note 2819941 (should probably only be used with use_in_memory_tracking = false),           ")
     print("         default: -1 (not used)                                                                                                    ")
     print(" -tcb    with backup [true/false], the trace files that are removed with the -tc and -te flags are backed up (as a .gz),           ")
     print("         i.e. ALTER SYSTEM CLEAR TRACES ... WITH BACKUP, see SQL Ref., default: false                                              ")
@@ -2103,7 +2104,7 @@ def printHelp():
     print("         days are removed, default: -1 (not used)            (requires SELECT and DELETE on the _SYS_STATISTICS schema)            ")
     print("         ----  DATA VOLUMES FRAGMENTATION  ----                                                                                    ")
     print(" -fl     fragmentation limit [%], maximum fragmentation of data volume files, of any service, before defragmentation of that       ")
-    print("         service is started: ALTER SYSTEM RECLAIM DATAVOLUME '<host>:<port>’ 120 DEFRAGMENT,        default: -1 (not used)         ")
+    print("         service is started: ALTER SYSTEM RECLAIM DATAVOLUME '<host>:<port>' 120 DEFRAGMENT,        default: -1 (not used)         ")
     print("         Note: If you use System Replication see Q19 in SAP Note 1999880.                                                          ")
     print(" -fo     output fragmentation [true/false], displays data volume statistics before and after defragmentation, default: false       ")
     print("         ----  MULTIPLE ROW STORE TABLE CONTAINERS   ----                                                                          ")
@@ -2136,6 +2137,10 @@ def printHelp():
     print("         ---- VIRTUAL TABLE STATISTICS CREATION ----                                                                               ")
     print(" -vs     create statistics for virtual tables [true/false], switch to create optimization statistics for those virtual tables      ")
     print("         that are missing statistics according to SAP Note 1872652 (Note: could cause expenive operations),    default: false      ")
+    print(" -vm     max number columns for statistic creations. Creating VTs' statistics can be expensive if there are many columns           ")
+    print("         (SAP Note 1872652), so if -vm is less number of columns of the VT, statistics will be created with multiple executions    ")
+    print("         Example: if -vm = 100 and # columns of the VT is 230, 3 executions will be done for this VT, the last execution with 30   ")
+    print("         columns,       default: 1000                                                                                              ")    
     print(" -vt     default statistics type [HISTOGRAM/SIMPLE/TOPK/SKETCH/SAMPLE/RECORD_COUNT], type of data statistics object                ")
     print("         default: HISTOGRAM                                                                                                        ")
     print(" -vn     max number of rows for defult type [number rows], if the VT has less or equal number of rows specified by -vn the default ")
@@ -2153,12 +2158,13 @@ def printHelp():
     print("         be refreshed      (Note: -vl and -vr holds also for refresh)                                   default: -1 (no refresh)   ")
     print("         ---- INIFILE CONTENT HISTORY ----                                                                                         ")
     print(" -ir     inifile content history retention [days], deletes older inifile content history, default: -1 (not used) (should > 1 year) ")
+    print("         Note: Only supported with 03<SPS<SPS05.                                                                                   ")
     print("         ---- INTERVALL  ----                                                                                                      ")
     print(" -hci    hana cleaner interval [days], number days that hanacleaner waits before it restarts, default: -1 (exits after 1 cycle)    ")
     print("         NOTE: Do NOT use if you run hanacleaner in a cron job!                                                                    ")
     print("         ---- INPUT  ----                                                                                                          ")
-    print(" -ff     flag file, full path to a file that contains input flags, each flag in a new line, all lines in the file that does not    ")
-    print("         start with a flag are considered comments, if this flag is used no other flags should be given, default: '' (not used)    ")
+    print(" -ff     flag file(s), a comma seperated list of full paths to files that contain input flags, each flag in a new line, all lines  ")
+    print("         in the files that do not start with a flag (a minus) are considered comments, default: '' (not used)                      ")
     print("         Note: if you include %SID in the path, it will automatically be replaced with the actually SID of your system             ")
     print("         ---- EXECUTE  ----                                                                                                        ")
     print(" -es     execute sql [true/false], execute all crucial housekeeping tasks (useful to turn off for investigation with -os=true,     ")
@@ -2169,6 +2175,8 @@ def printHelp():
     print("         Note: if you include %SID in the output path, it will automatically be replaced with the actually SID of your system      ")
     print(" -of     output prefix, adds a string to the output file, default: ''   (not used)                                                 ")
     print(" -or     output retention days, logs in the paths specified with -op are only saved for this number of days, default: -1 (not used)")
+    print(" -oc     output configuration [true/false], logs all parameters set by the flags and where the flags were set, i.e. what flag file ")
+    print("         (one of the files listed in -ff) or if it was set via a flag specified on the command line, default = false               ")
     print(" -so     standard out switch [true/false], switch to write to standard out, default:  true                                         ")
     print("         ---- INSTANCE ONLINE CHECK ----                                                                                           ")
     print(" -oi     online test interval [seconds], < 0: HANACleaner does not check if online or secondary,           default: -1 (not used)  ")
@@ -2176,6 +2184,7 @@ def printHelp():
     print("                                         > 0: time it waits before it checks if DB is online and primary again                     ")
     print("                                              Note: For the > 0 option it might be necessary to use cron with the lock option      ")
     print("                                                    See the HANASitter & CRON slide in the HANASitter pdf                          ")
+    print("         Note: for now, -oi is not supported for a server running HANA Cockpit                                                     ")
     print("         ---- SERVER FULL CHECK ----                                                                                               ")
     print(" -fs     file system, path to server to check for disk full situation before hanacleaner runs, default: blank, i.e. df -h is used  ")
     print('                      Could also be used to specify a couple of servers with e.g. -fs "|grep sapmnt"                               ')
@@ -2196,13 +2205,20 @@ def printHelp():
     print("         Note: It is not possible to use underscore in the user key, e.g. HANA_HOUSEKEEPING is NOT possible                        ")
     print(" -dbs    DB key, this can be a list of databases accessed from the system defined by -k (-k can only be one key if -dbs is used)   ")               
     print("         Note: Users with same name and password have to be maintained in all databases   , default: ''  (not used)                ")
-    print("         Example:  -k PQLSYSDB -dbs SYSTEMDB, PQL                                                                                  ")
+    print("         It is possible to specify  -dbs all  to execute hanacleaner on all active databases, then -k must point to SYSTEMDB       ")
+    print("         Example:  -k PQLSYSDBKEY -dbs SYSTEMDB,PQL,PQ2                                                                            ")
+    print("         Example:  -k PQLSYSDBKEY -dbs all                                                                                         ")
     print("         ---- EMAIL ----                                                                                                           ")
-    print(" -en     email notification, <recievers email>,<sender's email>,<mail server>                                                      ") 
-    print("                             example: -en you@ourcompany,me@ourcompany.com,smtp.intra.ourcompany.com                               ")
+    print(" -en     email notification for most fatal errors, <receiver 1's email>,<receiver 2's email>,... default:          (not used)      ") 
+    print(" -et     email timeout warning [seconds], sends email to the email addresses specified with -en, if HANACleaner took longer time   ")
+    print("         than specified with -et, default: -1 (not used)                                                                           ")
+    print(" -ena    always send email, if set to true, a summary of the hanacleaner run is always send (-en must be true), default: false     ")
+    print(" -enc    email client, to explicitly specify the client (e.g mail, mailx, mutt,..), only useful if -en if used, default: mailx     ") 
+    print(" -ens    sender's email, to explicitly specify sender's email address, only useful if -en if used, default:    (configured used)   ")
+    print(" -enm    mail server, to explicitly specify the mail server, only useful if -en is used, default:     (configured used)            ")
     print('         NOTE: For this to work you have to install the linux program "sendmail" and add a line similar to                         ')
-    print("         DSsmtp.intra.ourcompany.com in the file sendmail.cf in /etc/mail/, see                                                    ")
-    print("         https://www.systutorials.com/5167/sending-email-using-mailx-in-linux-through-internal-smtp/                               ")
+    print('               DSsmtp.intra.ourcompany.com in the file sendmail.cf in /etc/mail/,                                                  ')
+    print("               see https://www.systutorials.com/5167/sending-email-using-mailx-in-linux-through-internal-smtp/                     ")
     print("                                                                                                                                   ")    
     print("                                                                                                                                   ")    
     print("EXAMPLE (trace files, statistics server alerts and backup catalog entries, i.e. not the backups themselves, older than 42 days     ")
@@ -2233,8 +2249,10 @@ def printHelp():
     print(" 4. Allow a two steps cleanup for general files, e.g. compress file older than a few hours and delete files older than some days   ")
     print(" 5. Check for multiple definitions of one flag, give ERROR, and STOP                                                               ")
     print(" 6. Move trace files instead of deleting ... --> not a good idea ... should not touch trace files from OS, only from HANA          ")
-    print(" 7. Change -en flag to allow multiple email recievers.                                                                             ")
-    print(" 8. Only send emails in case of some failure, either an found error or a catched error                                             ")
+    print(" 7. Only send emails in case of some failure, either an found error or a catched error                                             ")
+    print(" 8. HANA Cleaner should be able to clean up its own tracefiles (-or) even though it is Secondary on a System Replicaiton setup     ")
+    print("    The same is true about some other cleanups... e.g. ANY FILES                                                                   ")
+    print(" 9. It should be possible to influence the ignore list of the -tf flag with a flag getting a list of files not to delete           ")
     print("                                                                                                                                   ")
     print("AUTHOR: Christian Hansen                                                                                                           ")
     print("                                                                                                                                   ")
@@ -2283,27 +2301,52 @@ class SQLManager:
             self.hdbsql_jAaxU = hdbsql_string + " -j -A -a -x -U " + self.key
             self.hdbsql_jAQaxU = hdbsql_string + " -j -A -Q -a -x -U " + self.key
 
-
 class LogManager:
-    def __init__(self, log_path, out_prefix, print_to_std):
+    def __init__(self, log_path, out_prefix, print_to_std, emailSender):
         self.path = log_path
         self.out_prefix = out_prefix
         if self.out_prefix:
             self.out_prefix = self.out_prefix + "_"
         self.print_to_std = print_to_std
-        
+        self.emailSender = emailSender
+
 class EmailSender:
-    def __init__(self, recieverEmail, senderEmail, mailServer):
-        self.recieverEmail = recieverEmail
+    def __init__(self, receiverEmails, emailClient, senderEmail, mailServer, SID):
         self.senderEmail = senderEmail
+        self.emailClient = emailClient
+        self.receiverEmails = receiverEmails
         self.mailServer = mailServer
+        self.SID = SID
     def printEmailSender(self):
-        print "Reciever Email: ", self.recieverEmail, "  Sender Email: ", self.senderEmail, "  Mail Server: ", self.mailServer 
+        print("Email Client: ", self.emailClient)
+        if self.senderEmail:
+            print("Sender Email: ", self.senderEmail)
+        else:
+            print("Configured sender email will be used.")
+        if self.mailServer:
+            print("Mail Server: ", self.mailServer)
+        else:
+            print("Configured mail server will be used.")
+        print("Reciever Emails: ", self.recieverEmails)
 
 ######################## FUNCTION DEFINITIONS ################################
 
+def run_command(cmd, stderrdevnull = False):
+    if sys.version_info[0] == 2: 
+        if stderrdevnull:
+            with open(os.devnull, 'w') as devnull:
+                out = subprocess.check_output(cmd, shell=True, stderr=devnull).strip("\n")
+        else:
+            out = subprocess.check_output(cmd, shell=True).strip("\n")
+    elif sys.version_info[0] == 3:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip("\n")
+    else:
+        print("ERROR: Wrong Python version")
+        os._exit(1)
+    return out
+
 def get_sid():
-    SID = subprocess.check_output('echo $SAPSYSTEMNAME',  shell=True).strip("\n").upper()
+    SID = run_command('echo $SAPSYSTEMNAME').upper()
     return SID
 
 def is_integer(s):
@@ -2313,30 +2356,44 @@ def is_integer(s):
     except ValueError:
         return False
 
-def log(message, logmanager):
+def log(message, logmanager, send_email = False):
     if logmanager.print_to_std:
-        print message
+        print(message)
     if logmanager.path:
         file_name = "hanacleanerlog"
         logfile = open(logmanager.path+"/"+file_name+"_"+logmanager.out_prefix+datetime.now().strftime("%Y-%m-%d"+".txt").replace(" ", "_"), "a")
         logfile.write(message+"\n")   
         logfile.flush()
         logfile.close()
+    if send_email and logmanager.emailSender:  #sends email IF this call of log() wants it AND IF -en flag has been specified with email(s)
+        sendEmail(message, logmanager)
 
-def try_execute_sql(sql, errorlog, sqlman, logman, exit_on_fail = True):
+def sendEmail(message, logmanager):       
+    message = 'Hi Team, \n\nHANACleaner reports:\n\n'+message
+    mailstring = 'echo "'+message+'" | '+logmanager.emailSender.emailClient+' -s "Message from HANACleaner on '+logmanager.emailSender.SID+'" '
+    if logmanager.emailSender.mailServer:
+        mailstring += ' -S smtp=smtp://'+logmanager.emailSender.mailServer+' '
+    if logmanager.emailSender.senderEmail:
+        mailstring += ' -S from="'+logmanager.emailSender.senderEmail+'" '
+    mailstring += ",".join(logmanager.emailSender.receiverEmails)
+    dummyout = run_command(mailstring)
+
+def try_execute_sql(sql, errorlog, sqlman, logman, exit_on_fail = True, always_execute = False):
     succeeded = True
     out = ""
     try:
         if sqlman.log:
             log(sql, logman)
-        if sqlman.execute:
-            out = subprocess.check_output(sqlman.hdbsql_jAaxU + " \""+sql+"\"", shell=True)
+        if sqlman.execute or always_execute:
+            out = run_command(sqlman.hdbsql_jAaxU + " \""+sql+"\"")
     except:
-        log("ERROR: Could not execute\n"+sql, logman)
-        log(errorlog, logman)
+        errorMessage = "ERROR: Could not execute\n"+sql+"\n"+errorlog
         succeeded = False
         if exit_on_fail:
+            log(errorMessage, logman, True)
             os._exit(1)
+        else:
+            log(errorMessage, logman)
     return [out, succeeded]
 
 def is_email(s):
@@ -2346,19 +2403,40 @@ def is_email(s):
     return '.' in s[1]
 
 def hana_version_revision_maintenancerevision(sqlman, logman):
-    command_run = subprocess.check_output(sqlman.hdbsql_jAU + " \"select value from sys.m_system_overview where name = 'Version'\"", shell=True)
+    command_run = run_command(sqlman.hdbsql_jAU + " \"select value from sys.m_system_overview where name = 'Version'\"")
     hanaver = command_run.splitlines(1)[2].split('.')[0].replace('| ','')
     hanarev = command_run.splitlines(1)[2].split('.')[2]
     hanamrev = command_run.splitlines(1)[2].split('.')[3]
     if not is_integer(hanarev):
-        log("ERROR: something went wrong checking hana revision.", logman)
+        log("ERROR: something went wrong checking hana revision.", logman, True)
         os._exit(1)
     return [int(hanaver), int(hanarev), int(hanamrev)]
     
 def hosts(sqlman):
-    hosts = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select distinct(host) from sys.m_host_information\"", shell=True).splitlines(1)
+    hosts = run_command(sqlman.hdbsql_jAaxU + " \"select distinct(host) from sys.m_host_information\"").splitlines(1)
     hosts = [host.strip('\n').strip('|').strip(' ') for host in hosts]
     return hosts
+
+def get_key_info(dbuserkey, local_host, logman):
+    try:
+        key_environment = run_command('''hdbuserstore LIST '''+dbuserkey) 
+    except:
+        log("ERROR, the key "+dbuserkey+" is not maintained in hdbuserstore.", logman, True)
+        os._exit(1)
+    if "NOT FOUND" in key_environment:
+        log("ERROR, the key "+dbuserkey+" is not maintained in hdbuserstore.", logman, True)
+        os._exit(1)
+    key_environment = key_environment.split('\n')
+    key_environment = [ke for ke in key_environment if ke and not ke == 'Operation succeed.']
+    ENV = key_environment[1].replace('  ENV : ','').replace(';',',').split(',')
+    key_hosts = [env.split(':')[0].split('.')[0] for env in ENV]  #if full host name is specified in the Key, only the first part is used
+    DATABASE = ''
+    if len(key_environment) == 4:   # if DATABASE is specified in the key, this will by used in the SQLManager (but if -dbs is specified, -dbs wins)
+        DATABASE = key_environment[3].replace('  DATABASE: ','').replace(' ', '')
+    if not local_host in key_hosts:
+        print("ERROR, local host, ", local_host, ", should be one of the hosts specified for the key, ", dbuserkey, " (in case of virtual, please use -vlh, see --help for more info)")
+        os._exit(1)
+    return  [key_hosts, ENV, DATABASE]
 
 def sql_for_backup_id_for_min_retained_days(minRetainedDays):
     oldestDayForKeepingBackup = datetime.now() + timedelta(days = -int(minRetainedDays))
@@ -2380,10 +2458,13 @@ def online_and_master_tests(online_test_interval, local_dbinstance, local_host, 
 def is_master(local_dbinstance, local_host, logman):
     process = subprocess.Popen(['python', cdalias('cdpy', local_dbinstance)+"/landscapeHostConfiguration.py"], stdout=subprocess.PIPE)
     out, err = process.communicate()
+    out = out.decode()
     out_lines = out.splitlines(1)
-    host_line = [line for line in out_lines if local_host in line]  #have not tested this with virtual and -vlh yet
+    host_line = [line for line in out_lines if local_host in line or local_host.upper() in line or local_host.lower() in line]  #have not tested this with virtual and -vlh yet
     if len(host_line) != 1:
-        log("ERROR: Something went wrong. It found more than one (or none) host line: ", host_line)
+        print_out = "ERROR: Something went wrong. It found more than one (or none) host line" + " \n ".join(host_line)
+        log(print_out, logman, True)
+        os._exit(1)
     nameserver_actual_role = host_line[0].strip('\n').split('|')[11].strip(' ')
     test_ok = (str(err) == "None")
     result = nameserver_actual_role == 'master'
@@ -2394,6 +2475,7 @@ def is_master(local_dbinstance, local_host, logman):
 def is_online(dbinstance, logman): #Checks if all services are GREEN and if there exists an indexserver (if not this is a Stand-By) 
     process = subprocess.Popen(['sapcontrol', '-nr', dbinstance, '-function', 'GetProcessList'], stdout=subprocess.PIPE)
     out, err = process.communicate()
+    out = out.decode()
     number_services = out.count(" HDB ") + out.count(" Local Secure Store")   
     number_running_services = out.count("GREEN")
     number_indexservers = int(out.count("hdbindexserver")) # if not indexserver this is Stand-By
@@ -2406,21 +2488,63 @@ def is_online(dbinstance, logman): #Checks if all services are GREEN and if ther
 def is_secondary(logman):
     process = subprocess.Popen(['hdbnsutil', '-sr_state'], stdout=subprocess.PIPE)
     out, err = process.communicate() 
+    out = out.decode()
     test_ok = (str(err) == "None")
     result = "active primary site" in out   # then it is secondary!
     printout = "Primary Check     , "+datetime.now().strftime("%Y-%m-%d %H:%M:%S")+"    ,     -            , "+str(test_ok)+"         , "+str(not result)+"       , " 
     log(printout, logman)
     return result 
 
+def get_all_databases(execute_sql, hdbsql_string, dbuserkey, local_host, out_sql, logman): 
+    all_db_out = ''
+    [key_hosts, ENV, DATABASE] = get_key_info(dbuserkey, local_host, logman)
+    key_sqlports = [env.split(':')[1] for env in ENV]     
+    if not key_sqlports[0][-2:] == '13':
+        log("ERROR: If  -bds all  is used, then  -k  must point to SYSTEMDB. Please see --help for more information.", logman)
+        os._exit(1)
+    sqlman = SQLManager(execute_sql, hdbsql_string, dbuserkey, DATABASE, out_sql)
+    all_db_out = run_command(sqlman.hdbsql_jAaxU + " \"select DATABASE_NAME from M_DATABASES WHERE (ACTIVE_STATUS = 'YES')\"")
+    all_databases = [line.strip('|').strip(' ') for line in all_db_out.splitlines()]
+    if (len(all_databases) == 0) or \
+        (len(all_databases) == 1) and all_databases[0] == '':
+        log("\nERROR: No active database found. ", logman)
+        os._exit(1)
+    return all_databases
+
 def checkIfAcceptedFlag(word):
-    if not word in ["-h", "--help", "-d", "--disclaimer", "-ff", "-be", "-bd", "-bb", "-bo", "-br", "-bn", "-tc", "-te", "-tcb", "-tbd", "-tmo", "-tf", "-to", "-td", "-dr", "-gr", "-gd", "-gw", "-gm", "-zb", "-zp", "-zl", "-zo", "-zk", "-ar", "-kr", "-ao", "-ad", "-om", "-oo", "-lr", "-eh", "-eu", "-ur", "-pe", "-fl", "-fo", "-rc", "-ro", "-cc", "-ce", "-cr", "-cs", "-cd", "-cq", "-cu", "-cb", "-cp", "-cm", "-co", "-vs", "-vt", "-vn", "-vtt", "-vto", "-vr", "-vnr", "-vl", "-ir", "-es", "-os", "-op", "-of", "-or", "-oi", "-fs", "-if", "-df", "-hci", "-so", "-ssl", "-vlh", "-k", "-dbs", "-en"]:
-        print "INPUT ERROR: ", word, " is not one of the accepted input flags. Please see --help for more information."
+    if not word in ["-h", "--help", "-d", "--disclaimer", "-ff", "-be", "-bd", "-bb", "-bo", "-br", "-bn", "-tc", "-te", "-tcb", "-tbd", "-tmo", "-tf", "-to", "-td", "-dr", "-gr", "-gd", "-gw", "-gm", "-zb", "-zp", "-zl", "-zo", "-zk", "-ar", "-kr", "-ao", "-ad", "-om", "-oo", "-lr", "-eh", "-eu", "-ur", "-pe", "-fl", "-fo", "-rc", "-ro", "-cc", "-ce", "-cr", "-cs", "-cd", "-cq", "-cu", "-cb", "-cp", "-cm", "-co", "-vs", "-vm", "-vt", "-vn", "-vtt", "-vto", "-vr", "-vnr", "-vl", "-ir", "-es", "-os", "-op", "-of", "-or", "-oc", "-oi", "-fs", "-if", "-df", "-hci", "-so", "-ssl", "-vlh", "-k", "-dbs", "-en", "-et", "-ena", "-enc", "-ens", "-enm"]:
+        print("INPUT ERROR: ", word, " is not one of the accepted input flags. Please see --help for more information.")
         os._exit(1)
 
+def getParameterFromFile(flag, flag_string, flag_value, flag_file, flag_log, parameter):
+    if flag == flag_string:
+        parameter = flag_value
+        flag_log[flag_string] = [flag_value, flag_file]
+    return parameter
+
+def getParameterListFromFile(flag, flag_string, flag_value, flag_file, flag_log, parameter):
+    if flag == flag_string:
+        parameter = [x for x in flag_value.split(',')]
+        flag_log[flag_string] = [flag_value, flag_file]
+    return parameter
+
+def getParameterFromCommandLine(sysargv, flag_string, flag_log, parameter):
+    if flag_string in sysargv:
+        flag_value = sysargv[sysargv.index(flag_string) + 1]
+        parameter = flag_value
+        flag_log[flag_string] = [flag_value, "command line"]
+    return parameter
+
+def getParameterListFromCommandLine(sysargv, flag_string, flag_log, parameter):
+    if flag_string in sysargv:
+        parameter = [x for x in sysargv[  sysargv.index(flag_string) + 1   ].split(',')]
+        flag_log[flag_string] = [','.join(parameter), "command line"]
+    return parameter
+   
 def backup_id(minRetainedBackups, minRetainedDays, sqlman):
     if minRetainedDays >= 0:
-        results = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"" + sql_for_backup_id_for_min_retained_days(minRetainedDays) + "\"", shell=True).splitlines(1)
-        [backupIdForMinRetainedDays, startTimeForMinRetainedDays, dummy] = results if results else ['', '', '']
+        results = run_command(sqlman.hdbsql_jAQaxU + " \"" + sql_for_backup_id_for_min_retained_days(minRetainedDays) + "\"").splitlines(1)
+        [backupIdForMinRetainedDays, startTimeForMinRetainedDays] = results if results else ['', '']
         if not backupIdForMinRetainedDays:
             backupIdForMinRetainedDays = '-1'
             startTimeForMinRetainedDays = '1000-01-01 08:00:00'
@@ -2428,8 +2552,8 @@ def backup_id(minRetainedBackups, minRetainedDays, sqlman):
             backupIdForMinRetainedDays = backupIdForMinRetainedDays.strip('\n').strip(' ')
             startTimeForMinRetainedDays = startTimeForMinRetainedDays.strip('\n').strip(' ').split('.')[0]  #removing milliseconds
     if minRetainedBackups >= 0:
-        results = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"" + sql_for_backup_id_for_min_retained_backups(minRetainedBackups) + "\"", shell=True).splitlines(1)
-        [backupIdForMinRetainedBackups, startTimeForMinRetainedBackups, dummy] = results if results else ['', '', '']
+        results = run_command(sqlman.hdbsql_jAQaxU + " \"" + sql_for_backup_id_for_min_retained_backups(minRetainedBackups) + "\"").splitlines(1)
+        [backupIdForMinRetainedBackups, startTimeForMinRetainedBackups] = results if results else ['', '']
         if not backupIdForMinRetainedBackups:
             backupIdForMinRetainedBackups = '-1'
             startTimeForMinRetainedBackups = '1000-01-01 08:00:00'
@@ -2450,15 +2574,15 @@ def sqls_for_backup_catalog_cleanup(minRetainedBackups, minRetainedDays, deleteB
     sqls = []
     backupId = backup_id(minRetainedBackups, minRetainedDays, sqlman)
     if backupId:
-        backupType = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select ENTRY_TYPE_NAME from sys.m_backup_catalog where backup_id = '"+backupId+"'\"", shell=True).strip('\n').strip(' ')
+        backupType = run_command(sqlman.hdbsql_jAQaxU + " \"select ENTRY_TYPE_NAME from sys.m_backup_catalog where backup_id = '"+backupId+"'\"").strip(' ')
         if backupType == "complete data backup" or backupType == "data snapshot":
             sqls = ["BACKUP CATALOG DELETE ALL BEFORE BACKUP_ID " + backupId]
             if deleteBackups:
                 sqls = ["BACKUP CATALOG DELETE ALL BEFORE BACKUP_ID " + backupId + " COMPLETE"]
         #If it will ever be possible to do    BACKUP CATALOG DELETE BACKUP_ID <log backup id>    then this will be useful:
         else:
-            backupIdStartTime = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select SYS_START_TIME from sys.m_backup_catalog where backup_id = '"+backupId+"'\"", shell=True).strip(' ')         
-            olderBackupIds = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select BACKUP_ID from sys.m_backup_catalog where SYS_START_TIME < '"+backupIdStartTime+"'\"", shell=True).splitlines()
+            backupIdStartTime = run_command(sqlman.hdbsql_jAQaxU + " \"select SYS_START_TIME from sys.m_backup_catalog where backup_id = '"+backupId+"'\"").strip(' ')         
+            olderBackupIds = run_command(sqlman.hdbsql_jAQaxU + " \"select BACKUP_ID from sys.m_backup_catalog where SYS_START_TIME < '"+backupIdStartTime+"'\"").splitlines()
             olderBackupIds = [x.strip('\n').strip(' ') for x in olderBackupIds if x]
             for oldID in olderBackupIds:
                 sql = "BACKUP CATALOG DELETE BACKUP_ID " + oldID
@@ -2468,8 +2592,10 @@ def sqls_for_backup_catalog_cleanup(minRetainedBackups, minRetainedDays, deleteB
     return sqls
         
 def print_removed_entries(before, after, logman):
-    beforeLines = before.splitlines(1)
+    beforeLines = before.splitlines(1) 
+    beforeLines = [x.replace('\n', '')  for x in beforeLines]
     afterLines = after.splitlines(1)
+    afterLines = [x.replace('\n', '')  for x in afterLines]
     dif = list(Differ().compare(beforeLines, afterLines))
     removedLines = [line.strip("- ").strip("\n") for line in dif if line[0] == '-']
     if removedLines:
@@ -2481,33 +2607,33 @@ def print_removed_entries(before, after, logman):
 
 def clean_backup_catalog(minRetainedBackups, minRetainedDays, deleteBackups, outputCatalog, outputDeletedCatalog, outputNDeletedLBEntries, sqlman, logman):  
     if outputCatalog or outputDeletedCatalog:
-        nCatalogEntries = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select count(*) from sys.m_backup_catalog\"", shell=True).strip(' '))
+        nCatalogEntries = int(run_command(sqlman.hdbsql_jAQaxU + " \"select count(*) from sys.m_backup_catalog\"").strip(' '))
         if nCatalogEntries > 100000:
-            log("INPUT ERROR: Please do not use -br true or -bo true if your backup catalog is larger than 100000 entries!", logman)
-            os._exit(1)      
-    nDataBackupCatalogEntriesBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name != 'log backup'\"", shell=True).strip(' '))
+            log("INPUT ERROR: Please do not use -br true or -bo true if your backup catalog is larger than 100000 entries!", logman, True)
+            os._exit(1)
+    nDataBackupCatalogEntriesBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name != 'log backup'\"").strip(' '))
     nLogBackupCatalogEntriesBefore = 0
     if outputNDeletedLBEntries:
-        nLogBackupCatalogEntriesBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name = 'log backup'\"", shell=True).strip(' '))
+        nLogBackupCatalogEntriesBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name = 'log backup'\"").strip(' '))
     if nDataBackupCatalogEntriesBefore == 0:
         return [0,0]
     sqls_for_cleanup = sqls_for_backup_catalog_cleanup(minRetainedBackups, minRetainedDays, deleteBackups, sqlman)
     if sqls_for_cleanup:
-        sql_for_catalog = "select ENTRY_ID, ENTRY_TYPE_NAME, BACKUP_ID, SYS_START_TIME, STATE_NAME from sys.m_backup_catalog"
+        sql_for_catalog = "select ENTRY_ID, ENTRY_TYPE_NAME, BACKUP_ID, SYS_START_TIME from sys.m_backup_catalog"
         if outputCatalog or outputDeletedCatalog:
-            beforeCatalog = subprocess.check_output(sqlman.hdbsql_jAxU + " \"" + sql_for_catalog + "\"", shell=True)
+            beforeCatalog = run_command(sqlman.hdbsql_jAxU + " \"" + sql_for_catalog + "\"")
         if outputCatalog:
             log("\nBEFORE:\n"+beforeCatalog, logman)
         for sql_for_cleanup in sqls_for_cleanup:
             errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not clean backup catalog. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the system privilege BACKUP ADMIN.\n"
             errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql_for_cleanup+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
             try_execute_sql(sql_for_cleanup, errorlog, sqlman, logman)                 
-        nDataBackupCatalogEntriesAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name != 'log backup'\"", shell=True).strip(' '))
+        nDataBackupCatalogEntriesAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name != 'log backup'\"").strip(' '))
         nLogBackupCatalogEntriesAfter = 0
         if outputNDeletedLBEntries:
-            nLogBackupCatalogEntriesAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name = 'log backup'\"", shell=True).strip(' '))
+            nLogBackupCatalogEntriesAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_backup_catalog where entry_type_name = 'log backup'\"").strip(' '))
         if outputCatalog or outputDeletedCatalog:
-            afterCatalog = subprocess.check_output(sqlman.hdbsql_jAxU + " \"" + sql_for_catalog + "\"", shell=True)
+            afterCatalog = run_command(sqlman.hdbsql_jAxU + " \"" + sql_for_catalog + "\"")
         if outputCatalog:
             log("\nAFTER:\n"+afterCatalog, logman)
         if outputDeletedCatalog:
@@ -2526,15 +2652,14 @@ def clear_traces(trace_list, oldestRetainedTraceContentDate, backupTraceContent,
     try_execute_sql(sql, errorlog, sqlman, logman)    
      
 def clean_trace_files(retainedTraceContentDays, retainedExpensiveTraceContentDays, backupTraceContent, backupTraceDirectory, timeOutForMove, retainedTraceFilesDays, outputTraces, outputRemovedTraces, SID, DATABASE, local_dbinstance, hosts, sqlman, logman):
-    nbrTracesBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles\"", shell=True).strip(' '))
-    #nbrZippedTracesBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles where FILE_NAME like '%.gz%'\"", shell=True).strip(' '))
+    nbrTracesBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles\"").strip(' '))
     if nbrTracesBefore == 0:
         return 0  
     if outputTraces:
-        beforeTraces = subprocess.check_output(sqlman.hdbsql_jAxU + " \"select * from sys.m_tracefiles order by file_mtime desc\"", shell=True)
+        beforeTraces = run_command(sqlman.hdbsql_jAxU + " \"select * from sys.m_tracefiles order by file_mtime desc\"")
         log("\nBEFORE:\n"+beforeTraces, logman)
     if outputRemovedTraces:
-        beforeTraceFiles = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select HOST, FILE_NAME from sys.m_tracefiles order by file_mtime desc\"", shell=True)
+        beforeTraceFiles = run_command(sqlman.hdbsql_jAaxU + " \"select HOST, FILE_NAME from sys.m_tracefiles order by file_mtime desc\"")
     if retainedTraceContentDays != "-1" or retainedExpensiveTraceContentDays != "-1":
         oldestRetainedTraceContentDate = datetime.now() + timedelta(days = -int(retainedTraceContentDays))
         timeStampsForClearTraces = [datetime.now().strftime("%Y%m%d%H%M%S"), (datetime.now() + timedelta(seconds=1)).strftime("%Y%m%d%H%M%S"), (datetime.now() + timedelta(seconds=2)).strftime("%Y%m%d%H%M%S"), (datetime.now() + timedelta(seconds=3)).strftime("%Y%m%d%H%M%S")]
@@ -2545,7 +2670,7 @@ def clean_trace_files(retainedTraceContentDays, retainedExpensiveTraceContentDay
         if backupTraceDirectory:
             if not DATABASE:
                 log("INPUT ERROR: If -tbd is used, either DATABASE must be specified in the key (see the manual of hdbuserstore), or -dbs must be specifed.", logman)
-                log("NOTE: -tbd is not supported for none MDC systems", logman)
+                log("NOTE: -tbd is not supported for none MDC systems", logman, True)
                 os._exit(1)
             if not os.path.exists(backupTraceDirectory):
                 os.makedirs(backupTraceDirectory)
@@ -2558,22 +2683,22 @@ def clean_trace_files(retainedTraceContentDays, retainedExpensiveTraceContentDay
                 time.sleep(1)
                 waitedSeconds += 1
                 sql = "select FILE_NAME from sys.m_tracefiles where FILE_NAME like '%" + "' or FILE_NAME like '%".join(fileName for fileName in fileNameEndingsToWaitFor) + "'"
-                filesToWaitFor = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"", shell=True).splitlines(1)
+                filesToWaitFor = run_command(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"").splitlines(1)
                 filesToWaitFor = [file.strip('\n').strip(' ') for file in filesToWaitFor]
                 filesToWaitFor = [file for file in filesToWaitFor if file]
             if waitedSeconds < timeOutForMove:
                 sql = "select FILE_NAME from sys.m_tracefiles where FILE_NAME like '%" + "' or FILE_NAME like '%".join(fileName for fileName in fileNameEndingsToBeMoved) + "'"
-                filesToBeMoved = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"", shell=True).splitlines(1)
+                filesToBeMoved = run_command(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"").splitlines(1)
                 filesToBeMoved = [file.strip('\n').strip(' ') for file in filesToBeMoved]
                 filesToBeMoved = [file for file in filesToBeMoved if file]
                 for host in hosts:
                     path = cdalias('cdhdb', local_dbinstance)+"/"+host 
                     for filename in filesToBeMoved:
-                        fullFileName = subprocess.check_output("find "+path+" -name "+filename, shell=True).strip('\n').strip(' ')
+                        fullFileName = run_command("find "+path+" -name "+filename).strip('\n').strip(' ')
                         if fullFileName and ((DATABASE == 'SYSTEMDB' and 'DB_' in fullFileName) or (DATABASE != 'SYSTEMDB' and not 'DB_'+DATABASE in fullFileName)):
                             fullFileName = ''
                         if fullFileName:
-                            subprocess.check_output("mv "+fullFileName+" "+backupTraceDirectory+"/", shell=True)
+                            dummyout = run_command("mv "+fullFileName+" "+backupTraceDirectory+"/")
                 if outputRemovedTraces and filesToBeMoved:
                     log("\nARCHIVED ("+str(len(filesToBeMoved))+"):", logman)
                     for filename in filesToBeMoved:
@@ -2583,43 +2708,45 @@ def clean_trace_files(retainedTraceContentDays, retainedExpensiveTraceContentDay
     if retainedTraceFilesDays != "-1":
         oldestRetainedTraceFilesDate = datetime.now() + timedelta(days = -int(retainedTraceFilesDays))
         sql = "select FILE_NAME from sys.m_tracefiles where file_size != '-1' and file_mtime < '"+oldestRetainedTraceFilesDate.strftime('%Y-%m-%d')+" "+datetime.now().strftime("%H:%M:%S")+"'"  # file_size = -1 --> folder, cannot be removed
-        filesToBeRemoved = subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"", shell=True).splitlines(1)
+        filesToBeRemoved = run_command(sqlman.hdbsql_jAQaxU + " \"" + sql + "\"").splitlines(1)
         filesToBeRemoved = [file.strip('\n').strip(' ') for file in filesToBeRemoved if file != '\n'] 
-        # Ignore files with names that breaks the ALTER command, or kill.sap according to SAP Note 2349144, and backup.log and backint.log since they are taken care of by -zb, see SAP Note 2431472 about hdbdaemon, we do not want to delete any .sem or .status file, and we do not want to delete any links, e.g. .sap<SID>_HDB<inst>
-        filesToBeRemoved = [file for file in filesToBeRemoved if not (" " in file or "," in file or "'" in file or "kill.sap" in file or "backup.log" in file or "backint.log" in file or "hdbdaemon.status" in file or "sapstart.sem" in file or "sapstart.log" in file or ".sap"+SID+"_HDB"+local_dbinstance in file)]
+        # Ignore files with names that breaks the ALTER command, or kill.sap according to SAP Note 2349144, and backup.log and backint.log since they are taken care of by -zb, see SAP Note 2431472 about hdbdaemon, we do not want to delete any .sem or .status file, and we do not want to delete any links, e.g. .sap<SID>_HDB<inst>, and we dont want to delete the log for the webdispatcher
+        filesToBeRemoved = [file for file in filesToBeRemoved if not (" " in file or "," in file or "'" in file or "kill.sap" in file or "backup.log" in file or "backint.log" in file or "hdbdaemon.status" in file or "sapstart.sem" in file or "sapstart.log" in file or ".sap"+SID+"_HDB"+local_dbinstance in file or "http_fe.log" in file)]
         # Make sure we only delete files with known extensions (we dont delete .sem or .status files). Added two files without extensions that we want to delete. To delete files like dev_icm_sec one have to run HANACleaner as dev_icm_sec from SYSTEMDB, otherwise they are not in m_tracefiles
         filesToBeRemoved = [file for file in filesToBeRemoved if any(x in file for x in [".trc", ".log", ".stat", ".py", ".tpt", ".gz", ".zip", ".old", ".xml", ".txt", ".docs", ".cfg", ".dmp", ".cockpit", ".xs", "dev_icm_sec", "wdisp_icm_log"])] 
         if filesToBeRemoved:  # otherwise no file to remove
-            filesToBeRemoved = [filesToBeRemoved[i:i + 100] for i in xrange(0, len(filesToBeRemoved), 100)]  #make sure we do not send too long statement, it could cause an error
+            filesToBeRemoved = [filesToBeRemoved[i:i + 100] for i in range(0, len(filesToBeRemoved), 100)]  #make sure we do not send too long statement, it could cause an error
             for files in filesToBeRemoved:
                 filesToBeRemovedString = "'"+"', '".join(files)+"'"
                 for host in hosts:
                     sql = "ALTER SYSTEM REMOVE TRACES (" +"'"+host+"', "+filesToBeRemovedString+ ")"
                     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not remove traces. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the system privilege TRACE ADMIN.\n"
                     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
-                    try_execute_sql(sql, errorlog, sqlman, logman)                               
-    nbrTracesAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles\"", shell=True).strip(' '))
-    #nbrZippedTracesAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles where FILE_NAME like '%.gz%'\"", shell=True).strip(' '))
+                    try_execute_sql(sql, errorlog, sqlman, logman)                          
+    nbrTracesAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.m_tracefiles\"").strip(' '))
     nbrRemovedTraceFiles = nbrTracesBefore - nbrTracesAfter
     if outputTraces:
-        afterTraces = subprocess.check_output(sqlman.hdbsql_jAxU + " \"select * from sys.m_tracefiles order by file_mtime desc\"", shell=True)
+        afterTraces = run_command(sqlman.hdbsql_jAxU + " \"select * from sys.m_tracefiles order by file_mtime desc\"")
         log("\nAFTER:\n"+afterTraces, logman)
     if outputRemovedTraces and nbrRemovedTraceFiles:
-        afterTraceFiles = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select HOST, FILE_NAME from sys.m_tracefiles order by file_mtime desc\"", shell=True)
+        afterTraceFiles = run_command(sqlman.hdbsql_jAaxU + " \"select HOST, FILE_NAME from sys.m_tracefiles order by file_mtime desc\"")
         output_removed_trace_files(beforeTraceFiles, afterTraceFiles, logman)
     return nbrRemovedTraceFiles
 
 def clean_dumps(retainedDumpDays, local_dbinstance, sqlman, logman):
-    path = cdalias('cdglo', local_dbinstance)+"/sapcontrol/snapshots/" 
-    with open(os.devnull, 'w') as devnull:
-        nbrDumpsBefore = int(subprocess.check_output("ls "+path+"fullsysteminfodump* | wc -l", shell=True, stderr=devnull).strip(' ')) 
-        if not nbrDumpsBefore:
-            return 0
-        if sqlman.log:
-            log("find "+path+"fullsysteminfodump* -mtime +"+retainedDumpDays+" -delete", logman)
-        if sqlman.execute:
-            subprocess.check_output("find "+path+"fullsysteminfodump* -mtime +"+retainedDumpDays+" -delete", shell=True, stderr=devnull)
-        nbrDumpsAfter = int(subprocess.check_output("ls "+path+"fullsysteminfodump* | wc -l", shell=True, stderr=devnull).strip(' ')) 
+    path = (cdalias('cdglo', local_dbinstance)+"/sapcontrol/snapshots/").replace("\n","").replace("'", "") #RHEL put in line endings and strange '
+    if ' ' in path:
+        print("ERROR: The path should not contain a empty space! path = \n", path)
+        os._exit(1)
+    nbrDumpsBefore = int(run_command("ls "+path+"fullsysteminfodump* | wc -l", True).strip(' ')) #this might be a problem ... from https://docs.python.org/3/library/subprocess.html#subprocess.getoutput : 
+    #The stdout and stderr arguments may not be supplied at the same time as capture_output. If you wish to capture and combine both streams into one, use stdout=PIPE and stderr=STDOUT instead of capture_output.
+    if not nbrDumpsBefore:
+        return 0
+    if sqlman.log:
+        log("find "+path+"fullsysteminfodump* -mtime +"+retainedDumpDays+" -delete", logman)
+    if sqlman.execute:
+        dummyout = run_command("find "+path+"fullsysteminfodump* -mtime +"+retainedDumpDays+" -delete")
+    nbrDumpsAfter = int(run_command("ls "+path+"fullsysteminfodump* | wc -l").strip(' ')) 
     return nbrDumpsBefore - nbrDumpsAfter
            
 
@@ -2640,25 +2767,25 @@ def output_removed_trace_files(before, after, logman):
 
 def clean_alerts(minRetainedAlertDays, outputAlerts, outputDeletedAlerts, sqlman, logman):
     try:
-        nbrAlertsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _sys_statistics.statistics_alerts_base\"", shell=True).strip(' '))
+        nbrAlertsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _sys_statistics.statistics_alerts_base\"").strip(' '))
     except: 
-        log("\nERROR: The user represented by the key "+sqlman.key+" could not find amount of alerts. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the table _sys_statistics.statistics_alerts_base.\n", logman)
+        log("\nERROR: The user represented by the key "+sqlman.key+" could not find amount of alerts. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the table _sys_statistics.statistics_alerts_base.\n", logman, True)
         os._exit(1)
     if nbrAlertsBefore > 10000 and (outputAlerts or outputDeletedAlerts):
         outputAlerts = False
         outputDeletedAlerts = False
         log("INFO: The flags -ao and -ad were changed to false since there are too many alerts for printout.", logman)
     if outputAlerts or outputDeletedAlerts:
-        beforeAlerts = subprocess.check_output(sqlman.hdbsql_jAxU + " \"select SNAPSHOT_ID, ALERT_ID, ALERT_TIMESTAMP, ALERT_RATING from _SYS_STATISTICS.STATISTICS_ALERTS_BASE\"", shell=True)
+        beforeAlerts = run_command(sqlman.hdbsql_jAxU + " \"select SNAPSHOT_ID, ALERT_ID, ALERT_TIMESTAMP, ALERT_RATING from _SYS_STATISTICS.STATISTICS_ALERTS_BASE\"")
     if outputAlerts:
         log("\nBEFORE:\n"+beforeAlerts, logman)
     sql = "DELETE FROM _SYS_STATISTICS.STATISTICS_ALERTS_BASE WHERE ALERT_TIMESTAMP < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(minRetainedAlertDays)+")"
     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not delete alerts. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege DELETE on the table _sys_statistics.statistics_alerts_base.\n"
     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
     try_execute_sql(sql, errorlog, sqlman, logman)     
-    nbrAlertsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _sys_statistics.statistics_alerts_base\"", shell=True).strip(' '))
+    nbrAlertsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _sys_statistics.statistics_alerts_base\"").strip(' '))
     if outputAlerts or outputDeletedAlerts:
-        afterAlerts = subprocess.check_output(sqlman.hdbsql_jAxU + " \"select SNAPSHOT_ID, ALERT_ID, ALERT_TIMESTAMP, ALERT_RATING from _SYS_STATISTICS.STATISTICS_ALERTS_BASE\"", shell=True)
+        afterAlerts = run_command(sqlman.hdbsql_jAxU + " \"select SNAPSHOT_ID, ALERT_ID, ALERT_TIMESTAMP, ALERT_RATING from _SYS_STATISTICS.STATISTICS_ALERTS_BASE\"")
     if outputAlerts:
         log("\nAFTER:\n"+afterAlerts, logman)
     if outputDeletedAlerts:
@@ -2667,25 +2794,30 @@ def clean_alerts(minRetainedAlertDays, outputAlerts, outputDeletedAlerts, sqlman
     
 def clean_ini(minRetainedIniDays, version, revision, mrevision, sqlman, logman):
     if version < 2 or revision < 30:
-        log("\nERROR: the -ir flag is only supported starting with SAP HANA 2.0 SPS03. You run on SAP HANA "+str(version)+" revision "+str(revision)+" maintenance revision "+str(mrevision), logman)
+        log("\nERROR: the -ir flag is only supported starting with SAP HANA 2.0 SPS03. You run on SAP HANA "+str(version)+" revision "+str(revision)+" maintenance revision "+str(mrevision), logman, True)
+        os._exit(1)
+    if version > 4:
+        log("\nERROR: the -ir flag is not supported any more with SAP HANA 2.0 SPS05. You run on SAP HANA "+str(version)+" revision "+str(revision)+" maintenance revision "+str(mrevision), logman, True)
+        # compare https://help.sap.com/viewer/4fe29514fd584807ac9f2a04f6754767/2.0.05/en-US/fb097f2620c645d18064ce6b93c24a1e.html
+        # with https://help.sap.com/viewer/4fe29514fd584807ac9f2a04f6754767/2.0.04/en-US/fb097f2620c645d18064ce6b93c24a1e.html 
         os._exit(1)
     try:
-        nbrIniHistBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENT_HISTORY\"", shell=True).strip(' '))
+        nbrIniHistBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENT_HISTORY\"").strip(' '))
     except: 
-        log("\nERROR: The user represented by the key "+sqlman.key+" could not find amount of inifile history. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the view SYS.M_INIFILE_CONTENT_HISTORY.\n", logman)
+        log("\nERROR: The user represented by the key "+sqlman.key+" could not find amount of inifile history. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the view SYS.M_INIFILE_CONTENT_HISTORY.\n", logman, True)
         os._exit(1)
     d = datetime.today() - timedelta(days=minRetainedIniDays)
     sql = "ALTER SYSTEM CLEAR INIFILE CONTENT HISTORY UNTIL '"+str(d)+"'"
     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not delete inifile history. \nOne possible reason for this is insufficient privilege.\n"
     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
     try_execute_sql(sql, errorlog, sqlman, logman)     
-    nbrIniHistAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENT_HISTORY\"", shell=True).strip(' '))
+    nbrIniHistAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_INIFILE_CONTENT_HISTORY\"").strip(' '))
     return nbrIniHistBefore - nbrIniHistAfter
 
 def clean_objlock(minRetainedObjLockDays, sqlman, logman):
     try:
         sql = "select count(*) FROM _SYS_STATISTICS.HOST_OBJECT_LOCK_STATISTICS_BASE WHERE OBJECT_NAME = '(unknown)'"
-        nbrObjLockBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \""+sql+"\"", shell=True).strip(' '))
+        nbrObjLockBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \""+sql+"\"").strip(' '))
     except: 
         errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not select object locks. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the table _SYS_STATISTICS.HOST_OBJECT_LOCK_STATISTICS_BASE.\n"
         errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
@@ -2694,31 +2826,31 @@ def clean_objlock(minRetainedObjLockDays, sqlman, logman):
     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not delete object locks. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege DELETE on the table _SYS_STATISTICS.HOST_OBJECT_LOCK_STATISTICS_BASE.\n"
     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
     try_execute_sql(sql, errorlog, sqlman, logman)         
-    nbrObjLockAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select count(*) FROM _SYS_STATISTICS.HOST_OBJECT_LOCK_STATISTICS_BASE WHERE OBJECT_NAME = '(unknown)'\"", shell=True).strip(' '))
+    nbrObjLockAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"select count(*) FROM _SYS_STATISTICS.HOST_OBJECT_LOCK_STATISTICS_BASE WHERE OBJECT_NAME = '(unknown)'\"").strip(' '))
     return nbrObjLockBefore - nbrObjLockAfter
 
 def clean_objhist(objHistMaxSize, outputObjHist, sqlman, logman):
     try:
-        objHistSizeBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select disk_size from SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS where table_name = 'OBJECT_HISTORY'\"", shell=True).strip(' '))
+        objHistSizeBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"select disk_size from SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS where table_name = 'OBJECT_HISTORY'\"").strip(' '))
     except: 
-        log("\nERROR: The user represented by the key "+sqlman.key+" could not find size of object history. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the table SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS.\n", logman)
+        log("\nERROR: The user represented by the key "+sqlman.key+" could not find size of object history. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege SELECT on the table SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS.\n", logman, True)
         os._exit(1)  
     if objHistSizeBefore > objHistMaxSize*1000000:   #mb --> b 
         sql = "DELETE FROM _SYS_REPO.OBJECT_HISTORY WHERE (package_id, object_name, object_suffix, version_id) NOT IN (SELECT package_id, object_name, object_suffix, MAX(version_id) AS maxvid from _SYS_REPO.OBJECT_HISTORY GROUP BY package_id, object_name, object_suffix ORDER BY package_id, object_name, object_suffix)"
         errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not clean the object history. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege DELETE on the table _SYS_REPO.OBJECT_HISTORY.\n"
         errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
         try_execute_sql(sql, errorlog, sqlman, logman)  
-    objHistSizeAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select disk_size from SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS where table_name = 'OBJECT_HISTORY'\"", shell=True).strip(' '))
+    objHistSizeAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"select disk_size from SYS.M_TABLE_PERSISTENCE_LOCATION_STATISTICS where table_name = 'OBJECT_HISTORY'\"").strip(' '))
     if outputObjHist:
         log("Object History was:"+str(objHistSizeBefore/1000000)+" mb and is now "+str(objHistSizeAfter/1000000)+" mb.", logman)
     return (objHistSizeBefore - objHistSizeAfter)/1000000  
 
 def max_filesystem_usage_in_percent(file_system, ignore_filesystems, logman):
-    log("Will now check most used memory in the file systems. If it hangs there is an issue with  df -h, then see if the -fs flag helps.", logman)
+    log("Will now check most used memory in the file systems. If it hangs, there is an issue with  df -h, then see if the -fs flag helps.", logman)
     maxPercentage = 0
     lines = None 
     try:
-        lines = subprocess.check_output("df -h -P -x fuse.gvfs-fuse-daemon "+file_system, shell=True).splitlines(1)   # -x: telling df to ignore /root/.gvfs since normally <sid>adm lacking permissions, -P: Force output in one line for RedHat        
+        lines = run_command("df -h -P -x fuse.gvfs-fuse-daemon "+file_system).splitlines(1)   # -x: telling df to ignore /root/.gvfs since normally <sid>adm lacking permissions, -P: Force output in one line for RedHat        
     except:
         log("WARNING: Something went wrong executing df -h, \n therefore the most used memory in your file systems will not be checked. \n As a workaround it is possible to use the -fs flag to only take into account the most relevant file system.", logman)
     if lines:
@@ -2755,10 +2887,10 @@ def find_all(name, path, zipLinks):
     return result
     
 def getNbrRows(schema, table, sqlman):
-    return int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM "+schema+"."+table+" \"", shell=True).strip(' '))
+    return int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM "+schema+"."+table+" \"").strip(' '))
 
 def getAdapterName(schema, table, sqlman):
-    return subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT R.ADAPTER_NAME FROM SYS.REMOTE_SOURCES R JOIN SYS.VIRTUAL_TABLES V ON R.REMOTE_SOURCE_NAME = V.REMOTE_SOURCE_NAME WHERE V.SCHEMA_NAME = '"+schema+"' and TABLE_NAME = '"+table+"'\"", shell=True).strip(' ')
+    return run_command(sqlman.hdbsql_jAQaxU + " \"SELECT R.ADAPTER_NAME FROM SYS.REMOTE_SOURCES R JOIN SYS.VIRTUAL_TABLES V ON R.REMOTE_SOURCE_NAME = V.REMOTE_SOURCE_NAME WHERE V.SCHEMA_NAME = '"+schema+"' and TABLE_NAME = '"+table+"'\"").strip(' ')
 
 def zipBackupLogs(zipBackupLogsSizeLimit, zipBackupPath, zipLinks, zipOut, zipKeep, sqlman, logman):
     backup_log_pathes = find_all("backup.log", zipBackupPath, zipLinks)
@@ -2776,60 +2908,61 @@ def zipBackupLogs(zipBackupLogsSizeLimit, zipBackupPath, zipLinks, zipOut, zipKe
                 if not zipKeep:
                     log("rm "+newname, logman)
             if sqlman.execute:
-                subprocess.check_output("mv "+aLog+" "+tempname, shell=True)
-                subprocess.check_output("tar -czPf "+newname+" "+tempname, shell=True)      # P to avoid annoying error message
-                subprocess.check_output("rm "+tempname, shell=True)
+                dummyout = run_command("mv "+aLog+" "+tempname)
+                dummyout = run_command("tar -czPf "+newname+" "+tempname)      # P to avoid annoying error message
+                dummyout = run_command("rm "+tempname)
                 if zipOut:
                     log(aLog+" was compressed to "+newname+" and then removed", logman)
                 nZipped += 1
                 if not zipKeep:
-                    subprocess.check_output("rm "+newname, shell=True)
+                    dummyout = run_command("rm "+newname)
     return nZipped
     
 def cdalias(alias, local_dbinstance):   # alias e.g. cdtrace, cdhdb, ...
     su_cmd = ''
-    whoami = subprocess.check_output('whoami', shell=True).replace('\n','')
+    whoami = run_command('whoami').replace('\n','')
     if whoami.lower() == 'root':
         sidadm = get_sid().lower()+'adm'
         su_cmd = 'su - '+sidadm+' '
-    alias_cmd = su_cmd+'/bin/bash -l -c \'alias '+alias+'\''
-    command_run = subprocess.check_output(alias_cmd, shell=True)
+    alias_cmd = su_cmd+'/bin/bash -l -c \'alias '+alias+'\'|tail -1'   #tail -1 to remove other messages from e.g. profile.local
+    command_run = run_command(alias_cmd)
     pieces = re.sub(r'.*cd ','',command_run).strip("\n").strip("'").split("/")    #to remove ANSI escape codes (only needed in few systems)
     path = ''
     for piece in pieces:
         if piece and piece[0] == '$':
-            piece_cmd = su_cmd+'/bin/bash -l -c'+" \' echo "+piece+'\''
-            piece = (subprocess.check_output(piece_cmd, shell=True)).strip("\n")
+            piece_cmd = su_cmd+'/bin/bash -l -c'+" \' echo "+piece+'\'|tail -1'   #tail -1 to remove other messages from e.g. profile.local
+            piece = run_command(piece_cmd)
         path = path + '/' + piece + '/' 
     path = path.replace("[0-9][0-9]", local_dbinstance) # if /bin/bash shows strange HDB[0-9][0-9] we force correct instance on it
     return path
 
 def reclaim_logsegments(maxFreeLogsegments, sqlman, logman):
-    nTotFreeLogsegmentsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free'\"", shell=True, stderr=subprocess.STDOUT).strip(' '))
+    nTotFreeLogsegmentsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free'\"").strip(' ')) #this might be a problem ... from https://docs.python.org/3/library/subprocess.html#subprocess.getoutput : 
+    #The stdout and stderr arguments may not be supplied at the same time as capture_output. If you wish to capture and combine both streams into one, use stdout=PIPE and stderr=STDOUT instead of capture_output.
     if nTotFreeLogsegmentsBefore == 0:
-        return 0          
-    listOfPorts = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT DISTINCT PORT FROM SYS.M_LOG_SEGMENTS\"", shell=True).splitlines(1)
+        return 0 
+    listOfPorts = run_command(sqlman.hdbsql_jAaxU + " \"SELECT DISTINCT PORT FROM SYS.M_LOG_SEGMENTS\"").splitlines(1)
     listOfPorts = [port.strip('\n').strip('|').strip(' ') for port in listOfPorts]
     nFreeLogsegmentsPerServices = []
     for port in listOfPorts:
-        nFreeLogs = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free' AND PORT = '"+port+"'\"", shell=True).strip(' '))
+        nFreeLogs = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free' AND PORT = '"+port+"'\"").strip(' '))
         nFreeLogsegmentsPerServices.append(nFreeLogs)
     if max(nFreeLogsegmentsPerServices) > maxFreeLogsegments:
         sql = "ALTER SYSTEM RECLAIM LOG"
         errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not reclaim logs. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the privilege LOG ADMIN.\n"
         errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
-        try_execute_sql(sql, errorlog, sqlman, logman)        
-    nTotFreeLogsegmentsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free'\"", shell=True).strip(' '))
+        try_execute_sql(sql, errorlog, sqlman, logman)     
+    nTotFreeLogsegmentsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_LOG_SEGMENTS WHERE STATE = 'Free'\"").strip(' '))
     return nTotFreeLogsegmentsBefore - nTotFreeLogsegmentsAfter
     
     
 def clean_events(minRetainedDaysForHandledEvents, minRetainedDaysForEvents, sqlman, logman):                                                #ignoring INFO events, due to bug in HANA (fixed be rev. ???)
-    nHandledEventsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO'\"", shell=True).strip(' '))
-    nEventsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS \"", shell=True).strip(' '))
+    nHandledEventsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO'\"").strip(' '))
+    nEventsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS \"").strip(' '))
     if nEventsBefore == 0:
         return [0,0,0,0]    
     oldestDayForKeepingHandledEvent = datetime.now() + timedelta(days = -int(minRetainedDaysForHandledEvents))
-    listOfHandledEventsToRemove = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, ID FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO' AND CREATE_TIME < '"+oldestDayForKeepingHandledEvent.strftime('%Y-%m-%d')+" 00:00:00'\"", shell=True).splitlines(1)
+    listOfHandledEventsToRemove = run_command(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, ID FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO' AND CREATE_TIME < '"+oldestDayForKeepingHandledEvent.strftime('%Y-%m-%d')+" 00:00:00'\"").splitlines(1)
     listOfHandledEventsToRemove = [event.strip('\n').strip('|').split('|') for event in listOfHandledEventsToRemove]
     listOfHandledEventsToRemove = [[evComp.strip(' ') for evComp in event] for event in listOfHandledEventsToRemove]
     for event in listOfHandledEventsToRemove:
@@ -2840,7 +2973,7 @@ def clean_events(minRetainedDaysForHandledEvents, minRetainedDaysForEvents, sqlm
         try_execute_sql(sql1, errorlog, sqlman, logman)              
         try_execute_sql(sql2, errorlog, sqlman, logman)
     oldestDayForKeepingEvent = datetime.now() + timedelta(days = -int(minRetainedDaysForEvents))    
-    listOfEventsToRemove = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, ID, STATE FROM SYS.M_EVENTS WHERE TYPE != 'INFO' and CREATE_TIME < '"+oldestDayForKeepingEvent.strftime('%Y-%m-%d')+" 00:00:00'\"", shell=True).splitlines(1)
+    listOfEventsToRemove = run_command(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, ID, STATE FROM SYS.M_EVENTS WHERE TYPE != 'INFO' and CREATE_TIME < '"+oldestDayForKeepingEvent.strftime('%Y-%m-%d')+" 00:00:00'\"").splitlines(1)
     listOfEventsToRemove = [event.strip('\n').strip('|').split('|') for event in listOfEventsToRemove]
     listOfEventsToRemove = [[evComp.strip(' ') for evComp in event] for event in listOfEventsToRemove]
     for event in listOfEventsToRemove:
@@ -2860,38 +2993,38 @@ def clean_events(minRetainedDaysForHandledEvents, minRetainedDaysForEvents, sqlm
             errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql1+"\nand\n"+sql2+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
             try_execute_sql(sql1, errorlog, sqlman, logman)              
             try_execute_sql(sql2, errorlog, sqlman, logman)             
-    nHandledEventsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO'\"", shell=True).strip(' '))
-    nEventsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS \"", shell=True).strip(' '))    
+    nHandledEventsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS WHERE STATE = 'HANDLED' and TYPE != 'INFO'\"").strip(' '))
+    nEventsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.M_EVENTS \"").strip(' '))    
     return [nHandledEventsBefore - nHandledEventsAfter, nEventsBefore - nEventsAfter, nEventsAfter, nHandledEventsAfter]
 
 
 def clean_audit_logs(retainedAuditLogDays, sqlman, logman):  # for this, both Audit Admin and Audit Operator is needed
-    nbrLogsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.audit_log\"", shell=True).strip(' '))
+    nbrLogsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.audit_log\"").strip(' '))
     if nbrLogsBefore == 0:
         return 0  
     oldestRetainedAuditContentDate = datetime.now() + timedelta(days = -int(retainedAuditLogDays))
     sql = "ALTER SYSTEM CLEAR AUDIT LOG UNTIL '"+oldestRetainedAuditContentDate.strftime('%Y-%m-%d')+" "+datetime.now().strftime("%H:%M:%S")+"'" 
     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not clear traces. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the system privilege AUDIT ADMIN and/or AUDIT OPERATOR.\n"
     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner."
-    try_execute_sql(sql, errorlog, sqlman, logman)                     
-    nbrLogsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.audit_log\"", shell=True).strip(' '))
+    try_execute_sql(sql, errorlog, sqlman, logman)              
+    nbrLogsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM sys.audit_log\"").strip(' '))
     return nbrLogsBefore - nbrLogsAfter    
         
 
 def clean_pending_emails(pendingEmailsDays, sqlman, logman):
-    nbrEmailsBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _SYS_STATISTICS.STATISTICS_EMAIL_PROCESSING\"", shell=True).strip(' '))
+    nbrEmailsBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _SYS_STATISTICS.STATISTICS_EMAIL_PROCESSING\"").strip(' '))
     if nbrEmailsBefore == 0:
         return 0
     sql = "DELETE FROM _SYS_STATISTICS.STATISTICS_EMAIL_PROCESSING WHERE SECONDS_BETWEEN(SNAPSHOT_ID, CURRENT_TIMESTAMP) > "+pendingEmailsDays+" * 86400"
     errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not delete pending emails. \nOne possible reason for this is insufficient privilege, \ne.g. lack of the object privilege DELETE on the _SYS_STATISTICS schema.\n"
     errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner."
-    try_execute_sql(sql, errorlog, sqlman, logman)                     
-    nbrEmailsAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _SYS_STATISTICS.STATISTICS_EMAIL_PROCESSING\"", shell=True).strip(' '))
+    try_execute_sql(sql, errorlog, sqlman, logman)                   
+    nbrEmailsAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM _SYS_STATISTICS.STATISTICS_EMAIL_PROCESSING\"").strip(' '))
     return nbrEmailsBefore - nbrEmailsAfter    
           
 
 def defragment(fragmentationLimit, outputFragmentation, sqlman, logman):
-    fragPerPortBefore = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, USED_SIZE, TOTAL_SIZE from SYS.M_VOLUME_FILES WHERE FILE_TYPE = 'DATA'\" ", shell=True).splitlines(1)
+    fragPerPortBefore = run_command(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, USED_SIZE, TOTAL_SIZE from SYS.M_VOLUME_FILES WHERE FILE_TYPE = 'DATA'\" ").splitlines(1)
     fragPerPortBefore = [port.strip('\n').strip('|').split('|') for port in fragPerPortBefore]    
     fragPerPortBefore = [[elem.strip(' ') for elem in port] for port in fragPerPortBefore]    
     fragPerPortBefore = [port+[round(((float(port[3])-float(port[2]))/float(port[3])),2)*100] for port in fragPerPortBefore]  
@@ -2908,7 +3041,7 @@ def defragment(fragmentationLimit, outputFragmentation, sqlman, logman):
             errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
             errorlog += "Note: If you use System Replication see Q19 in SAP Note 1999880"
             try_execute_sql(sql, errorlog, sqlman, logman)             
-    fragPerPortAfter = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, USED_SIZE, TOTAL_SIZE from SYS.M_VOLUME_FILES WHERE FILE_TYPE = 'DATA'\" ", shell=True).splitlines(1)
+    fragPerPortAfter = run_command(sqlman.hdbsql_jAaxU + " \"SELECT HOST, PORT, USED_SIZE, TOTAL_SIZE from SYS.M_VOLUME_FILES WHERE FILE_TYPE = 'DATA'\" ").splitlines(1)
     fragPerPortAfter = [port.strip('\n').strip('|').split('|') for port in fragPerPortAfter]    
     fragPerPortAfter = [[elem.strip(' ') for elem in port] for port in fragPerPortAfter]    
     fragPerPortAfter = [port+[round(((float(port[3])-float(port[2]))/float(port[3])),2)*100] for port in fragPerPortAfter]        
@@ -2927,12 +3060,12 @@ def defragment(fragmentationLimit, outputFragmentation, sqlman, logman):
     return fragChange
     
 def reclaim_rs_containers(outputRcContainers, sqlman, logman):
-    nTablesWithMultipleRSContainersBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(TABLE_NAME) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"", shell=True).strip(' '))
-    nContCount = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(CONTAINER_COUNT) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"", shell=True).strip(' '))    
+    nTablesWithMultipleRSContainersBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(TABLE_NAME) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"").strip(' '))
+    nContCount = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(CONTAINER_COUNT) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"").strip(' '))    
     nUnnecessaryRSContainersBefore = 0
     if nContCount:    
-        nUnnecessaryRSContainersBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT SUM(CONTAINER_COUNT) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"", shell=True).strip(' ')) - nTablesWithMultipleRSContainersBefore
-    tablesWithMultipleRSContainers = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"SELECT SCHEMA_NAME, TABLE_NAME from SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\" ", shell=True).splitlines(1)
+        nUnnecessaryRSContainersBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT SUM(CONTAINER_COUNT) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"").strip(' ')) - nTablesWithMultipleRSContainersBefore
+    tablesWithMultipleRSContainers = run_command(sqlman.hdbsql_jAaxU + " \"SELECT SCHEMA_NAME, TABLE_NAME from SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\" ").splitlines(1)
     tablesWithMultipleRSContainers = [port.strip('\n').strip('|').split('|') for port in tablesWithMultipleRSContainers]    
     tablesWithMultipleRSContainers = [[elem.strip(' ') for elem in port] for port in tablesWithMultipleRSContainers]   
     if nUnnecessaryRSContainersBefore > 0:
@@ -2942,9 +3075,9 @@ def reclaim_rs_containers(outputRcContainers, sqlman, logman):
             errorlog += "Unfortunately there is NO nice way to give privileges to the DB User to be allowed to do this.\nEither you can run hanacleaner as SYSTEM user (NOT recommended) or grant DATA ADMIN to the user (NOT recommended).\n"               
             errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner"
             try_execute_sql(sql, errorlog, sqlman, logman)          
-    nTablesWithMultipleRSContainersAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(TABLE_NAME) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"", shell=True).strip(' '))
+    nTablesWithMultipleRSContainersAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(TABLE_NAME) FROM SYS.M_RS_TABLES WHERE CONTAINER_COUNT > 1\"").strip(' '))
     if nTablesWithMultipleRSContainersAfter != 0:
-        log("\nERROR: Something went wrong. After reclaim of multiple row store table containers we still have "+str(nTablesWithMultipleRSContainersAfter)+" tables with multiple row store containers. Please investigate.", logman)
+        log("\nERROR: Something went wrong. After reclaim of multiple row store table containers we still have "+str(nTablesWithMultipleRSContainersAfter)+" tables with multiple row store containers. Please investigate.", logman, True)
         os._exit(1)
     return [str(nTablesWithMultipleRSContainersBefore), str(nUnnecessaryRSContainersBefore)]
 
@@ -3004,13 +3137,13 @@ def force_compression(maxRawComp, maxEstComp, maxRowComp, maxMemComp, minDistCom
     #Tables with no compression
     tablesToCompress = []
     if all(c > -1 for c in [maxRawComp, maxEstComp]):
-        tablesToCompress = subprocess.check_output(sqlman.hdbsql_jAaxU + " \""+sql_nocomp+"\" ", shell=True).splitlines(1)
+        tablesToCompress = run_command(sqlman.hdbsql_jAaxU + " \""+sql_nocomp+"\" ").splitlines(1)
         tablesToCompress = [table.strip('\n').strip('|').split('|') for table in tablesToCompress]    
         tablesToCompress = [[elem.strip(' ') for elem in table] for table in tablesToCompress]
     #Columns with default compression
     moreTablesToCompress = []
-    if all(c > -1 for c in [maxRowComp, maxMemComp, minDistComp]):        
-        moreTablesToCompress = subprocess.check_output(sqlman.hdbsql_jAaxU + " \""+sql_default+"\" ", shell=True).splitlines(1)
+    if all(c > -1 for c in [maxRowComp, maxMemComp, minDistComp]):  
+        moreTablesToCompress = run_command(sqlman.hdbsql_jAaxU + " \""+sql_default+"\" ").splitlines(1)
         moreTablesToCompress = [table.strip('\n').strip('|').split('|') for table in moreTablesToCompress]    
         moreTablesToCompress = [[elem.strip(' ') for elem in table] for table in moreTablesToCompress]
         for newtab in moreTablesToCompress:   
@@ -3019,7 +3152,7 @@ def force_compression(maxRawComp, maxEstComp, maxRowComp, maxMemComp, minDistCom
     #Tables with too much UDIVs
     moreTablesToCompress = []
     if all(c > -1 for c in [maxQuotaComp, maxUDIVComp]):        
-        moreTablesToCompress = subprocess.check_output(sqlman.hdbsql_jAaxU + " \""+sql_udivs+"\" ", shell=True).splitlines(1)
+        moreTablesToCompress = run_command(sqlman.hdbsql_jAaxU + " \""+sql_udivs+"\" ").splitlines(1)
         moreTablesToCompress = [table.strip('\n').strip('|').split('|') for table in moreTablesToCompress]    
         moreTablesToCompress = [[elem.strip(' ') for elem in table] for table in moreTablesToCompress]
         for newtab in moreTablesToCompress:   
@@ -3028,7 +3161,7 @@ def force_compression(maxRawComp, maxEstComp, maxRowComp, maxMemComp, minDistCom
     #Columns with SPARE or PREFIXED
     moreTablesToCompress = []
     if maxBLOCKComp > -1:        
-        moreTablesToCompress = subprocess.check_output(sqlman.hdbsql_jAaxU + " \""+sql_block+"\" ", shell=True).splitlines(1)
+        moreTablesToCompress = run_command(sqlman.hdbsql_jAaxU + " \""+sql_block+"\" ").splitlines(1)
         moreTablesToCompress = [table.strip('\n').strip('|').split('|') for table in moreTablesToCompress]    
         moreTablesToCompress = [[elem.strip(' ') for elem in table] for table in moreTablesToCompress]
         for newtab in moreTablesToCompress:   
@@ -3053,14 +3186,14 @@ def force_compression(maxRawComp, maxEstComp, maxRowComp, maxMemComp, minDistCom
             log("    "+tab[0]+"."+tab[1], logman)
         log("\n", logman)
     return [len(tablesToCompress), failed]
-    
-def create_vt_statistics(vtSchemas, defaultVTStatType, maxRowsForDefaultVT, largeVTStatType, otherDBVTStatType, ignore2ndMon, sqlman, logman):  #SAP Note 1872652: Creating statistics on a virtual table can be an expensive operation. 
+
+def create_vt_statistics(vtSchemas, maxColumnsOfVT, defaultVTStatType, maxRowsForDefaultVT, largeVTStatType, otherDBVTStatType, ignore2ndMon, sqlman, logman):  #SAP Note 1872652: Creating statistics on a virtual table can be an expensive operation. 
     #Default statistics type: HISTOGRAM --> Creates a data statistics object that helps the query optimizer estimate the data distribution in a single-column data source
-    nVTs = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select count(*) from SYS.VIRTUAL_TABLES\"", shell=True).strip(' '))
-    nVTsWithoutStatBefore = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select COUNT(*) from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"", shell=True).strip(' '))
+    nVTs = int(run_command(sqlman.hdbsql_jAQaxU + " \"select count(*) from SYS.VIRTUAL_TABLES\"").strip(' '))
+    nVTsWithoutStatBefore = int(run_command(sqlman.hdbsql_jAQaxU + " \"select COUNT(*) from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"").strip(' '))
     if not nVTsWithoutStatBefore:
         return [nVTs, 0]
-    listOfVTsWithoutStat = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select SCHEMA_NAME, TABLE_NAME from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"", shell=True).splitlines(1)
+    listOfVTsWithoutStat = run_command(sqlman.hdbsql_jAaxU + " \"select SCHEMA_NAME, TABLE_NAME from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"").splitlines(1)
     listOfVTsWithoutStat = [vt.strip('\n').strip('|').split('|') for vt in listOfVTsWithoutStat]    
     listOfVTsWithoutStat = [[elem.strip(' ') for elem in vt] for vt in listOfVTsWithoutStat]       
     for vt in listOfVTsWithoutStat: 
@@ -3071,24 +3204,26 @@ def create_vt_statistics(vtSchemas, defaultVTStatType, maxRowsForDefaultVT, larg
                     statType = defaultVTStatType if getNbrRows(vt[0], vt[1], sqlman) <= maxRowsForDefaultVT else largeVTStatType
                 if otherDBVTStatType:
                     statType = statType if "hana" in getAdapterName(vt[0], vt[1], sqlman) else otherDBVTStatType
-                columns = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select column_name from PUBLIC.TABLE_COLUMNS where table_name = '"+vt[1]+"' and schema_name = '"+vt[0]+"'\"", shell=True).splitlines(1)
+                columns = run_command(sqlman.hdbsql_jAaxU + " \"select column_name from PUBLIC.TABLE_COLUMNS where table_name = '"+vt[1]+"' and schema_name = '"+vt[0]+"'\"").splitlines(1)
                 columns =[col.strip('\n').strip('|').strip(' ') for col in columns]
-                columns = '\\\", \\\"'.join(columns)                                                                                  # necessary for columns with mixed letter case
-                sql = 'CREATE STATISTICS ON \\\"'+vt[0]+'\\\".\\\"'+vt[1]+'\\\" (\\\"'+columns+'\\\") TYPE '+statType                 # necessary for tables starting with / and for tables with mixed letter case 
-                errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not create statistics on "+vt[0]+"."+vt[1]+". \nOne possible reason for this is insufficient privilege\n"
-                errorlog += "\nTry, as the user represented by the key "+sqlman.key+" to simply do  SELECT * FROM "+vt[0]+"."+vt[1]+". If that does not work then it could be that the privileges of source system's technical user (used in the SDA setup) is not sufficient.\n"
-                errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner\n"
-                errorlog += "It could be that the respective ODBC driver was not properly set up. Please then follow the SAP HANA Administration Guide."
-                try_execute_sql(sql, errorlog, sqlman, logman, exit_on_fail = False)  
-    nVTsWithoutStatAfter = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"select COUNT(*) from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"", shell=True).strip(' '))
+                column_chunks = [columns[x:x+maxColumnsOfVT] for x in range(0, len(columns), maxColumnsOfVT)]
+                for chunk in column_chunks:
+                    columns = '\\\", \\\"'.join(chunk)                                                                                  # necessary for columns with mixed letter case
+                    sql = 'CREATE STATISTICS ON \\\"'+vt[0]+'\\\".\\\"'+vt[1]+'\\\" (\\\"'+columns+'\\\") TYPE '+statType                 # necessary for tables starting with / and for tables with mixed letter case 
+                    errorlog = "\nERROR: The user represented by the key "+sqlman.key+" could not create statistics on "+vt[0]+"."+vt[1]+". \nOne possible reason for this is insufficient privilege\n"
+                    errorlog += "\nTry, as the user represented by the key "+sqlman.key+" to simply do  SELECT * FROM "+vt[0]+"."+vt[1]+". If that does not work then it could be that the privileges of source system's technical user (used in the SDA setup) is not sufficient.\n"
+                    errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner\n"
+                    errorlog += "It could be that the respective ODBC driver was not properly set up. Please then follow the SAP HANA Administration Guide."
+                    try_execute_sql(sql, errorlog, sqlman, logman, exit_on_fail = False)  
+    nVTsWithoutStatAfter = int(run_command(sqlman.hdbsql_jAQaxU + " \"select COUNT(*) from SYS.VIRTUAL_TABLES where TABLE_NAME NOT IN (select distinct DATA_SOURCE_OBJECT_NAME from SYS.DATA_STATISTICS)\"").strip(' '))
     return [nVTs, nVTsWithoutStatBefore - nVTsWithoutStatAfter]
 
 def refresh_statistics(vtSchemas, refreshAge, ignore2ndMon, sqlman, logman):
-    nDSs = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS\"", shell=True).strip(' '))
-    nDSToRefresh_before = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"", shell=True).strip(' '))
+    nDSs = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS\"").strip(' '))
+    nDSToRefresh_before = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"").strip(' '))
     if not nDSToRefresh_before:
         return [nDSs, 0]
-    listOfDSsToRefresh = subprocess.check_output(sqlman.hdbsql_jAaxU + " \"select DATA_STATISTICS_SCHEMA_NAME, DATA_STATISTICS_NAME FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"", shell=True).splitlines(1)
+    listOfDSsToRefresh = run_command(sqlman.hdbsql_jAaxU + " \"select DATA_STATISTICS_SCHEMA_NAME, DATA_STATISTICS_NAME FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"").splitlines(1)
     listOfDSsToRefresh = [ds.strip('\n').strip('|').split('|') for ds in listOfDSsToRefresh]    
     listOfDSsToRefresh = [[elem.strip(' ') for elem in ds] for ds in listOfDSsToRefresh] 
     for ds in listOfDSsToRefresh: 
@@ -3100,7 +3235,7 @@ def refresh_statistics(vtSchemas, refreshAge, ignore2ndMon, sqlman, logman):
                 errorlog += "If there is another error (i.e. not insufficient privilege) then please try to execute \n"+sql+"\nin e.g. the SQL editor in SAP HANA Studio. If you get the same error then this has nothing to do with hanacleaner\n"
                 errorlog += "It could be that the respective ODBC driver was not properly set up. Please then follow the SAP HANA Administration Guide."
                 try_execute_sql(sql, errorlog, sqlman, logman, exit_on_fail = False)  
-    nDSToRefresh_after = int(subprocess.check_output(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"", shell=True).strip(' '))
+    nDSToRefresh_after = int(run_command(sqlman.hdbsql_jAQaxU + " \"SELECT COUNT(*) FROM SYS.DATA_STATISTICS WHERE LAST_REFRESH_TIME < ADD_DAYS(CURRENT_TIMESTAMP, -"+str(refreshAge)+")\"").strip(' '))
     return [nDSs, nDSToRefresh_after - nDSToRefresh_before]
 
 def clean_output(minRetainedOutputDays, sqlman, logman):
@@ -3109,7 +3244,7 @@ def clean_output(minRetainedOutputDays, sqlman, logman):
     if sqlman.log:
         log("find "+path+"/hanacleanerlog* -mtime +"+str(minRetainedOutputDays)+" -delete", logman)
     if sqlman.execute:
-        subprocess.check_output("find "+path+"/hanacleanerlog* -mtime +"+str(minRetainedOutputDays)+" -delete", shell=True)
+        dummyout = run_command("find "+path+"/hanacleanerlog* -mtime +"+str(minRetainedOutputDays)+" -delete")
     nFilesAfter = len([name for name in os.listdir(path) if os.path.isfile(os.path.join(path, name))])
     return nFilesBefore - nFilesAfter  
     
@@ -3120,23 +3255,27 @@ def clean_anyfile(retainedAnyFileDays, anyFilePaths, anyFileWords, anyFileMaxDep
     else:
         retainedAnyFileDaysString = "-mtime +"+str(retainedAnyFileDays)
     for path, word in zip(anyFilePaths, anyFileWords):
-        nFilesBefore = int(subprocess.check_output("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -type f | wc -l", shell=True).strip(' '))
-        with open(os.devnull, 'w') as devnull:
+        nFilesBefore = int(run_command("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -type f | wc -l").strip(' '))
+        with open(os.devnull, 'w') as devnull:  #not needed anymore.. build in inside run_command, but only needed for python 2.7 ... remove this! 
             if sqlman.log:
                 log("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -name '*"+word+"*' -type f "+retainedAnyFileDaysString+" -delete", logman)
             if sqlman.execute:
                 try:
-                    subprocess.check_output("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -name '*"+word+"*' -type f "+retainedAnyFileDaysString+" -delete", shell=True, stderr=devnull)
+                    dummyout = run_command("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -name '*"+word+"*' -type f "+retainedAnyFileDaysString+" -delete")   #this might be a problem ... from https://docs.python.org/3/library/subprocess.html#subprocess.getoutput : 
+                    #The stdout and stderr arguments may not be supplied at the same time as capture_output. If you wish to capture and combine both streams into one, use stdout=PIPE and stderr=STDOUT instead of capture_output.
                 except:
                     pass   #File not  found, but no need to warn about that
-        nFilesAfter = int(subprocess.check_output("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -type f | wc -l", shell=True).strip(' '))
+        nFilesAfter = int(run_command("find "+path+" -maxdepth "+str(anyFileMaxDepth)+" -type f | wc -l").strip(' '))
         removedFiles += nFilesBefore - nFilesAfter
     return removedFiles  
     
-def checkAndConvertBooleanFlag(boolean, flagstring, logman):     
+def checkAndConvertBooleanFlag(boolean, flagstring, logman = ''):     
     boolean = boolean.lower()
     if boolean not in ("false", "true"):
-        log("INPUT ERROR: "+flagstring+" must be either 'true' or 'false'. Please see --help for more information.", logman)
+        if logman:
+            log("INPUT ERROR: "+flagstring+" must be either 'true' or 'false'. Please see --help for more information.", logman, True)
+        else:
+            print("INPUT ERROR: "+flagstring+" must be either 'true' or 'false'. Please see --help for more information.")
         os._exit(1)
     boolean = True if boolean == "true" else False
     return boolean
@@ -3144,17 +3283,17 @@ def checkAndConvertBooleanFlag(boolean, flagstring, logman):
 def main():
 
     #####################  CHECK PYTHON VERSION ###########
-    if sys.version_info[0] != 2 or not sys.version_info[1] in [7]:
-        print "VERSION ERROR: hanacleaner is only supported for Python 2.7.x. Did you maybe forget to log in as <sid>adm before executing this?"
+    if sys.version_info[0] != 2 and sys.version_info[0] != 3:
+        print("VERSION ERROR: hanacleaner is only supported for Python 2.7.x (for HANA 2 SPS05 and lower) and for Python 3.7.x (for HANA 2 SPS06 and higher). Did you maybe forget to log in as <sid>adm before executing this?")
         os._exit(1)
-
+ 
     #####################   DEFAULTS   ####################
     minRetainedBackups = "-1"
     minRetainedDays = "-1" #days
     deleteBackups = "false"
     outputCatalog = "false"
     outputDeletedCatalog = "false"
-    outputNDeletedLBEntries = "false"
+    outputNDeletedLBEntries = "true"
     backupTraceContent = "false"
     backupTraceDirectory = ""
     timeOutForMove = "30"
@@ -3171,7 +3310,12 @@ def main():
                                #     ENV : mo-fc8d991e0:30015
                                #     USER: SYSTEM
     dbases = ['']
-    email_notif = []
+    receiver_emails = None
+    email_timeout = "-1"
+    sendEmailSummary = "false" 
+    email_client = ''   #default email client, mailx, will be specifed later if -enc not provided
+    senders_email = None
+    mail_server = None
     retainedTraceContentDays = "-1"
     retainedExpensiveTraceContentDays = "-1"
     retainedTraceFilesDays = "-1"
@@ -3208,6 +3352,7 @@ def main():
     mergeBeforeComp = 'false'
     outComp = 'false'
     createVTStat = 'false'
+    maxColumnsOfVT = '1000'
     defaultVTStatType = 'HISTOGRAM'
     maxRowsForDefaultVT = '-1'
     largeVTStatType = 'SIMPLE'
@@ -3217,7 +3362,7 @@ def main():
     refreshAge = '-1'
     minRetainedIniDays = "-1" #days
     file_system = "" # by default check all file systems with  df -h
-    flag_file = ""    #default: no configuration input file
+    flag_files = []    #default: no configuration input file
     ignore_filesystems = ""
     execute_sql = 'true'
     out_sql = 'false'
@@ -3225,6 +3370,7 @@ def main():
     out_prefix = ""
     do_df_check = 'true'
     minRetainedOutputDays = "-1" #days
+    out_config = 'false'
     online_test_interval = "-1" #seconds
     std_out = "true" #print to std out
     virtual_local_host = "" #default: assume physical local host
@@ -3232,370 +3378,279 @@ def main():
     
     #####################  CHECK INPUT ARGUMENTS #################
     if len(sys.argv) == 1:
-        print "INPUT ERROR: hanacleaner needs input arguments. Please see --help for more information."
+        print("INPUT ERROR: hanacleaner needs input arguments. Please see --help for more information.")
         os._exit(1) 
     if len(sys.argv) != 2 and len(sys.argv) % 2 == 0:
-        print "INPUT ERROR: Wrong number of input arguments. Please see --help for more information." 
+        print("INPUT ERROR: Wrong number of input arguments. Please see --help for more information.")
         os._exit(1)
     for i in range(len(sys.argv)):
         if i % 2 != 0:
             if sys.argv[i][0] != '-':
-                print "INPUT ERROR: Every second argument has to be a flag, i.e. start with -. Please see --help for more information."
+                print("INPUT ERROR: Every second argument has to be a flag, i.e. start with -. Please see --help for more information.")
                 os._exit(1)
 
     ############ GET SID ##########
     SID = get_sid()
 
-    #####################  PRIMARY INPUT ARGUMENTS   ####################     
+    #####################  PRIMARY INPUT ARGUMENTS   ####################
+    flag_log = {}     
     if '-h' in sys.argv or '--help' in sys.argv:
         printHelp()   
     if '-d' in sys.argv or '--disclaimer' in sys.argv:
-        printDisclaimer()    
-    if '-ff' in sys.argv:
-        flag_file = sys.argv[sys.argv.index('-ff') + 1]
-        flag_file = flag_file.replace('%SID', SID)
+        printDisclaimer()
+    flag_files = getParameterListFromCommandLine(sys.argv, '-ff', flag_log, flag_files)    
+    flag_files = [ff.replace('%SID', SID) for ff in flag_files]
+    if flag_files:
+        print("Make sure the configuration file only contains ascii characters!")
 
     ############ CONFIGURATION FILE ###################
-    if flag_file:
+    for flag_file in flag_files:
         with open(flag_file, 'r') as fin:
             for line in fin:
                 firstWord = line.strip(' ').split(' ')[0]  
                 if firstWord[0:1] == '-':
                     checkIfAcceptedFlag(firstWord)
-                    #flagValue = line.strip(' ').split(' ')[1]
                     flagValue = line.strip(' ').split('"')[1].strip('\n').strip('\r') if line.strip(' ').split(' ')[1][0] == '"' else line.strip(' ').split(' ')[1].strip('\n').strip('\r')
-                    if firstWord == '-be':
-                        minRetainedBackups = flagValue
-                    if firstWord == '-bd':
-                        minRetainedDays = flagValue
-                    if firstWord == '-bb':
-                        deleteBackups = flagValue
-                    if firstWord == '-bo':
-                        outputCatalog = flagValue
-                    if firstWord == '-br':
-                        outputDeletedCatalog = flagValue
-                    if firstWord == '-bn':
-                        outputNDeletedLBEntries = flagValue
-                    if firstWord == '-tc':
-                        retainedTraceContentDays = flagValue
-                    if firstWord == '-te':
-                        retainedExpensiveTraceContentDays = flagValue
-                    if firstWord == '-tcb':
-                        backupTraceContent = flagValue
-                    if firstWord == '-tbd':
-                        backupTraceDirectory = flagValue
-                    if firstWord == '-tmo':
-                        timeOutForMove = flagValue
-                    if firstWord == '-tf':
-                        retainedTraceFilesDays = flagValue
-                    if firstWord == '-to':
-                        outputTraces = flagValue
-                    if firstWord == '-td':
-                        outputRemovedTraces = flagValue
-                    if firstWord == '-dr':
-                        retainedDumpDays = flagValue
-                    if firstWord == '-gr':
-                        retainedAnyFileDays = flagValue
-                    if firstWord == '-gd':
-                        anyFilePaths = [x for x in flagValue.split(',')]
-                        anyFilePaths = [p.replace('%SID', SID) for p in anyFilePaths]
-                    if firstWord == '-gw':
-                        anyFileWords = [x for x in flagValue.split(',')]
-                    if firstWord == '-gm':
-                        anyFileMaxDepth = flagValue
-                    if firstWord == '-zb':
-                        zipBackupLogsSizeLimit = flagValue
-                    if firstWord == '-zp':
-                        zipBackupPath = flagValue
-                    if firstWord == '-zl':
-                        zipLinks = flagValue
-                    if firstWord == '-zo':
-                        zipOut = flagValue
-                    if firstWord == '-zk':
-                        zipKeep = flagValue
-                    if firstWord == '-ar':
-                        minRetainedAlertDays = flagValue
-                    if firstWord == '-kr':
-                        minRetainedObjLockDays = flagValue
-                    if firstWord == '-ao':
-                        outputAlerts = flagValue
-                    if firstWord == '-ad':
-                        outputDeletedAlerts = flagValue
-                    if firstWord == '-om':
-                        objHistMaxSize = flagValue
-                    if firstWord == '-oo':
-                        outputObjHist = flagValue                        
-                    if firstWord == '-lr':
-                        maxFreeLogsegments = flagValue
-                    if firstWord == '-eh':
-                        minRetainedDaysForHandledEvents = flagValue
-                    if firstWord == '-eu':
-                        minRetainedDaysForEvents = flagValue
-                    if firstWord == '-ur':
-                        retainedAuditLogDays = flagValue
-                    if firstWord == '-pe':
-                        pendingEmailsDays = flagValue
-                    if firstWord == '-fl':
-                        fragmentationLimit = flagValue
-                    if firstWord == '-fo':
-                        outputFragmentation = flagValue
-                    if firstWord == '-rc':
-                        rcContainers = flagValue
-                    if firstWord == '-ro':
-                        outputRcContainers = flagValue
-                    if firstWord == '-cc':
-                        maxRawComp = flagValue   
-                    if firstWord == '-ce':
-                        maxEstComp = flagValue
-                    if firstWord == '-cr':
-                        maxRowComp = flagValue
-                    if firstWord == '-cs':
-                        maxMemComp = flagValue
-                    if firstWord == '-cd':
-                        minDistComp = flagValue
-                    if firstWord == '-cq':
-                        maxQuotaComp = flagValue                        
-                    if firstWord == '-cu':
-                        maxUDIVComp = flagValue
-                    if firstWord == '-cb':
-                        maxBLOCKComp = flagValue
-                    if firstWord == '-cp':
-                        partComp = flagValue
-                    if firstWord == '-cm':
-                        mergeBeforeComp = flagValue
-                    if firstWord == '-co':
-                        outComp = flagValue
-                    if firstWord == '-vs':
-                        createVTStat = flagValue
-                    if firstWord == '-vt':
-                        defaultVTStatType = flagValue
-                    if firstWord == '-vn':
-                        maxRowsForDefaultVT = flagValue
-                    if firstWord == '-vtt':
-                        largeVTStatType = flagValue
-                    if firstWord == '-vto':
-                        otherDBVTStatType = flagValue
-                    if firstWord == '-vl':
-                        vtSchemas = [x for x in flagValue.split(',')]
-                    if firstWord == '-vr':
-                        ignore2ndMon = flagValue
-                    if firstWord == '-vnr':
-                        refreshAge = flagValue
-                    if firstWord == '-ir':
-                        minRetainedIniDays = flagValue
-                    if firstWord == '-es':
-                        execute_sql = flagValue
-                    if firstWord == '-os':
-                        out_sql = flagValue
-                    if firstWord == '-op':
-                        out_path = flagValue
-                    if firstWord == '-of':
-                        out_prefix = flagValue
-                    if firstWord == '-or':
-                        minRetainedOutputDays = flagValue
-                    if firstWord == '-oi':
-                        online_test_interval = flagValue
-                    if firstWord == '-fs':
-                        file_system = flagValue
-                    if firstWord == '-if':
-                        ignore_filesystems = [x for x in flagValue.split(',')]
-                    if firstWord == '-df':
-                        do_df_check = flagValue
-                    if firstWord == '-hci':
-                        hanacleaner_interval = flagValue                    
-                    if firstWord == '-so':
-                        std_out = flagValue
-                    if firstWord == '-ssl':
-                        ssl = flagValue
-                    if firstWord == '-vlh':
-                        virtual_local_host = flagValue
-                    if firstWord == '-k':
-                        dbuserkeys = [x for x in flagValue.split(',')]
-                    if firstWord == '-dbs':
-                        dbases = [x for x in flagValue.split(',')]
-                    if firstWord == '-en': 
-                        email_notif = [x for x in flagValue.split(',')]
+                    minRetainedBackups                = getParameterFromFile(firstWord, '-be', flagValue, flag_file, flag_log, minRetainedBackups)
+                    minRetainedDays                   = getParameterFromFile(firstWord, '-bd', flagValue, flag_file, flag_log, minRetainedDays)
+                    deleteBackups                     = getParameterFromFile(firstWord, '-bb', flagValue, flag_file, flag_log, deleteBackups)
+                    outputCatalog                     = getParameterFromFile(firstWord, '-bo', flagValue, flag_file, flag_log, outputCatalog)
+                    outputDeletedCatalog              = getParameterFromFile(firstWord, '-br', flagValue, flag_file, flag_log, outputDeletedCatalog)
+                    outputNDeletedLBEntries           = getParameterFromFile(firstWord, '-bn', flagValue, flag_file, flag_log, outputNDeletedLBEntries)
+                    retainedTraceContentDays          = getParameterFromFile(firstWord, '-tc', flagValue, flag_file, flag_log, retainedTraceContentDays)
+                    retainedExpensiveTraceContentDays = getParameterFromFile(firstWord, '-te', flagValue, flag_file, flag_log, retainedExpensiveTraceContentDays)
+                    backupTraceContent                = getParameterFromFile(firstWord, '-tcb', flagValue, flag_file, flag_log, backupTraceContent)
+                    backupTraceDirectory              = getParameterFromFile(firstWord, '-tbd', flagValue, flag_file, flag_log, backupTraceDirectory)
+                    timeOutForMove                    = getParameterFromFile(firstWord, '-tmo', flagValue, flag_file, flag_log, timeOutForMove)
+                    retainedTraceFilesDays            = getParameterFromFile(firstWord, '-tf', flagValue, flag_file, flag_log, retainedTraceFilesDays)
+                    outputTraces                      = getParameterFromFile(firstWord, '-to', flagValue, flag_file, flag_log, outputTraces)
+                    outputRemovedTraces               = getParameterFromFile(firstWord, '-td', flagValue, flag_file, flag_log, outputRemovedTraces)
+                    retainedDumpDays                  = getParameterFromFile(firstWord, '-dr', flagValue, flag_file, flag_log, retainedDumpDays)
+                    retainedAnyFileDays               = getParameterFromFile(firstWord, '-gr', flagValue, flag_file, flag_log, retainedAnyFileDays)
+                    anyFilePaths                      = getParameterListFromFile(firstWord, '-gd', flagValue, flag_file, flag_log, anyFilePaths)
+                    anyFilePaths                      = [p.replace('%SID', SID) for p in anyFilePaths]
+                    anyFileWords                      = getParameterListFromFile(firstWord, '-gw', flagValue, flag_file, flag_log, anyFileWords)
+                    anyFileMaxDepth                   = getParameterFromFile(firstWord, '-gm', flagValue, flag_file, flag_log, anyFileMaxDepth)
+                    zipBackupLogsSizeLimit            = getParameterFromFile(firstWord, '-zb', flagValue, flag_file, flag_log, zipBackupLogsSizeLimit)
+                    zipBackupPath                     = getParameterFromFile(firstWord, '-zp', flagValue, flag_file, flag_log, zipBackupPath)
+                    zipLinks                          = getParameterFromFile(firstWord, '-zl', flagValue, flag_file, flag_log, zipLinks)
+                    zipOut                            = getParameterFromFile(firstWord, '-zo', flagValue, flag_file, flag_log, zipOut)
+                    zipKeep                           = getParameterFromFile(firstWord, '-zk', flagValue, flag_file, flag_log, zipKeep)
+                    minRetainedAlertDays              = getParameterFromFile(firstWord, '-ar', flagValue, flag_file, flag_log, minRetainedAlertDays)
+                    minRetainedObjLockDays            = getParameterFromFile(firstWord, '-kr', flagValue, flag_file, flag_log, minRetainedObjLockDays)
+                    outputAlerts                      = getParameterFromFile(firstWord, '-ao', flagValue, flag_file, flag_log, outputAlerts)
+                    outputDeletedAlerts               = getParameterFromFile(firstWord, '-ad', flagValue, flag_file, flag_log, outputDeletedAlerts)
+                    objHistMaxSize                    = getParameterFromFile(firstWord, '-om', flagValue, flag_file, flag_log, objHistMaxSize)
+                    outputObjHist                     = getParameterFromFile(firstWord, '-oo', flagValue, flag_file, flag_log, outputObjHist)
+                    maxFreeLogsegments                = getParameterFromFile(firstWord, '-lr', flagValue, flag_file, flag_log, maxFreeLogsegments)
+                    minRetainedDaysForHandledEvents   = getParameterFromFile(firstWord, '-eh', flagValue, flag_file, flag_log, minRetainedDaysForHandledEvents)
+                    minRetainedDaysForEvents          = getParameterFromFile(firstWord, '-eu', flagValue, flag_file, flag_log, minRetainedDaysForEvents)
+                    retainedAuditLogDays              = getParameterFromFile(firstWord, '-ur', flagValue, flag_file, flag_log, retainedAuditLogDays)
+                    pendingEmailsDays                 = getParameterFromFile(firstWord, '-pe', flagValue, flag_file, flag_log, pendingEmailsDays)
+                    fragmentationLimit                = getParameterFromFile(firstWord, '-fl', flagValue, flag_file, flag_log, fragmentationLimit)
+                    outputFragmentation               = getParameterFromFile(firstWord, '-fo', flagValue, flag_file, flag_log, outputFragmentation)
+                    rcContainers                      = getParameterFromFile(firstWord, '-rc', flagValue, flag_file, flag_log, rcContainers)
+                    outputRcContainers                = getParameterFromFile(firstWord, '-ro', flagValue, flag_file, flag_log, outputRcContainers)
+                    maxRawComp                        = getParameterFromFile(firstWord, '-cc', flagValue, flag_file, flag_log, maxRawComp)
+                    maxEstComp                        = getParameterFromFile(firstWord, '-ce', flagValue, flag_file, flag_log, maxEstComp)
+                    maxRowComp                        = getParameterFromFile(firstWord, '-cr', flagValue, flag_file, flag_log, maxRowComp)
+                    maxMemComp                        = getParameterFromFile(firstWord, '-cs', flagValue, flag_file, flag_log, maxMemComp)
+                    minDistComp                       = getParameterFromFile(firstWord, '-cd', flagValue, flag_file, flag_log, minDistComp)
+                    maxQuotaComp                      = getParameterFromFile(firstWord, '-cq', flagValue, flag_file, flag_log, maxQuotaComp)
+                    maxUDIVComp                       = getParameterFromFile(firstWord, '-cu', flagValue, flag_file, flag_log, maxUDIVComp)
+                    maxBLOCKComp                      = getParameterFromFile(firstWord, '-cb', flagValue, flag_file, flag_log, maxBLOCKComp)
+                    partComp                          = getParameterFromFile(firstWord, '-cp', flagValue, flag_file, flag_log, partComp)
+                    mergeBeforeComp                   = getParameterFromFile(firstWord, '-cm', flagValue, flag_file, flag_log, mergeBeforeComp)
+                    outComp                           = getParameterFromFile(firstWord, '-co', flagValue, flag_file, flag_log, outComp)
+                    createVTStat                      = getParameterFromFile(firstWord, '-vs', flagValue, flag_file, flag_log, createVTStat)
+                    maxColumnsOfVT                    = getParameterFromFile(firstWord, '-vm', flagValue, flag_file, flag_log, maxColumnsOfVT)
+                    defaultVTStatType                 = getParameterFromFile(firstWord, '-vt', flagValue, flag_file, flag_log, defaultVTStatType)
+                    maxRowsForDefaultVT               = getParameterFromFile(firstWord, '-vn', flagValue, flag_file, flag_log, maxRowsForDefaultVT)
+                    largeVTStatType                   = getParameterFromFile(firstWord, '-vtt', flagValue, flag_file, flag_log, largeVTStatType)
+                    otherDBVTStatType                 = getParameterFromFile(firstWord, '-vto', flagValue, flag_file, flag_log, otherDBVTStatType)
+                    vtSchemas                         = getParameterListFromFile(firstWord, '-vl', flagValue, flag_file, flag_log, vtSchemas)
+                    ignore2ndMon                      = getParameterFromFile(firstWord, '-vr', flagValue, flag_file, flag_log, ignore2ndMon)
+                    refreshAge                        = getParameterFromFile(firstWord, '-vnr', flagValue, flag_file, flag_log, refreshAge)
+                    minRetainedIniDays                = getParameterFromFile(firstWord, '-ir', flagValue, flag_file, flag_log, minRetainedIniDays)
+                    execute_sql                       = getParameterFromFile(firstWord, '-es', flagValue, flag_file, flag_log, execute_sql)
+                    out_sql                           = getParameterFromFile(firstWord, '-os', flagValue, flag_file, flag_log, out_sql)
+                    out_path                          = getParameterFromFile(firstWord, '-op', flagValue, flag_file, flag_log, out_path)
+                    out_prefix                        = getParameterFromFile(firstWord, '-of', flagValue, flag_file, flag_log, out_prefix)
+                    minRetainedOutputDays             = getParameterFromFile(firstWord, '-or', flagValue, flag_file, flag_log, minRetainedOutputDays)
+                    out_config                        = getParameterFromFile(firstWord, '-oc', flagValue, flag_file, flag_log, out_config)
+                    online_test_interval              = getParameterFromFile(firstWord, '-oi', flagValue, flag_file, flag_log, online_test_interval)
+                    file_system                       = getParameterFromFile(firstWord, '-fs', flagValue, flag_file, flag_log, file_system)
+                    ignore_filesystems                = getParameterListFromFile(firstWord, '-if', flagValue, flag_file, flag_log, ignore_filesystems)
+                    do_df_check                       = getParameterFromFile(firstWord, '-df', flagValue, flag_file, flag_log, do_df_check)
+                    hanacleaner_interval              = getParameterFromFile(firstWord, '-hci', flagValue, flag_file, flag_log, hanacleaner_interval)
+                    std_out                           = getParameterFromFile(firstWord, '-so', flagValue, flag_file, flag_log, std_out)
+                    ssl                               = getParameterFromFile(firstWord, '-ssl', flagValue, flag_file, flag_log, ssl)
+                    virtual_local_host                = getParameterFromFile(firstWord, '-vlh', flagValue, flag_file, flag_log, virtual_local_host)
+                    dbuserkeys                        = getParameterListFromFile(firstWord, '-k', flagValue, flag_file, flag_log, dbuserkeys)
+                    dbases                            = getParameterListFromFile(firstWord, '-dbs', flagValue, flag_file, flag_log, dbases)
+                    receiver_emails                   = getParameterListFromFile(firstWord, '-en', flagValue, flag_file, flag_log, receiver_emails)
+                    email_timeout                     = getParameterFromFile(firstWord, '-et', flagValue, flag_file, flag_log, email_timeout)
+                    sendEmailSummary                  = getParameterFromFile(firstWord, '-ena', flagValue, flag_file, flag_log, sendEmailSummary)
+                    email_client                      = getParameterFromFile(firstWord, '-enc', flagValue, flag_file, flag_log, email_client)
+                    senders_email                     = getParameterFromFile(firstWord, '-ens', flagValue, flag_file, flag_log, senders_email)
+                    mail_server                       = getParameterFromFile(firstWord, '-enm', flagValue, flag_file, flag_log, mail_server)
 
-    #####################   INPUT ARGUMENTS (these would overwrite whats in the configuration file)   ####################
+    #####################   INPUT ARGUMENTS (these would overwrite whats in the configuration file(s))   ####################
     for word in sys.argv:
         if word[0:1] == '-':
-            checkIfAcceptedFlag(word)     
-    if '-h' in sys.argv or '--help' in sys.argv:
-        printHelp()
-    if '-d' in sys.argv or '--disclaimer' in sys.argv:
-        printDisclaimer()
-    if '-be' in sys.argv:
-        minRetainedBackups = sys.argv[sys.argv.index('-be') + 1]
-    if '-bd' in sys.argv:
-        minRetainedDays = sys.argv[sys.argv.index('-bd') + 1]
-    if '-bb' in sys.argv:
-        deleteBackups = sys.argv[sys.argv.index('-bb') + 1]
-    if '-bo' in sys.argv:
-        outputCatalog = sys.argv[sys.argv.index('-bo') + 1]
-    if '-br' in sys.argv:
-        outputDeletedCatalog = sys.argv[sys.argv.index('-br') + 1]
-    if '-bn' in sys.argv:
-        outputNDeletedLBEntries = sys.argv[sys.argv.index('-bn') + 1]
-    if '-tc' in sys.argv:
-        retainedTraceContentDays = sys.argv[sys.argv.index('-tc') + 1]
-    if '-te' in sys.argv:
-        retainedExpensiveTraceContentDays = sys.argv[sys.argv.index('-te') + 1]
-    if '-tcb' in sys.argv:
-        backupTraceContent = sys.argv[sys.argv.index('-tcb') + 1]
-    if '-tbd' in sys.argv:
-        backupTraceDirectory = sys.argv[sys.argv.index('-tbd') + 1]
-    if '-tmo' in sys.argv:
-        timeOutForMove = sys.argv[sys.argv.index('-tmo') + 1]
-    if '-tf' in sys.argv:
-        retainedTraceFilesDays = sys.argv[sys.argv.index('-tf') + 1]
-    if '-to' in sys.argv:
-        outputTraces = sys.argv[sys.argv.index('-to') + 1]
-    if '-td' in sys.argv:
-        outputRemovedTraces = sys.argv[sys.argv.index('-td') + 1]
-    if '-dr' in sys.argv:
-        retainedDumpDays = sys.argv[sys.argv.index('-dr') + 1]
-    if '-gr' in sys.argv:
-        retainedAnyFileDays = sys.argv[sys.argv.index('-gr') + 1]
-    if '-gd' in sys.argv:
-        anyFilePaths = [x for x in sys.argv[  sys.argv.index('-gd') + 1   ].split(',')]
-        anyFilePaths = [p.replace('%SID', SID) for p in anyFilePaths]
-    if '-gw' in sys.argv:
-        anyFileWords = [x for x in sys.argv[  sys.argv.index('-gw') + 1   ].split(',')]
-    if '-gm' in sys.argv:
-        anyFileMaxDepth = sys.argv[sys.argv.index('-gm') + 1]
-    if '-zb' in sys.argv:
-        zipBackupLogsSizeLimit = sys.argv[sys.argv.index('-zb') + 1]
-    if '-zp' in sys.argv:
-        zipBackupPath = sys.argv[sys.argv.index('-zp') + 1]
-    if '-zl' in sys.argv:
-        zipLinks = sys.argv[sys.argv.index('-zl') + 1]
-    if '-zo' in sys.argv:
-        zipOut = sys.argv[sys.argv.index('-zo') + 1]
-    if '-zk' in sys.argv:
-        zipKeep = sys.argv[sys.argv.index('-zk') + 1]
-    if '-ar' in sys.argv:
-        minRetainedAlertDays = sys.argv[sys.argv.index('-ar') + 1]
-    if '-kr' in sys.argv:
-        minRetainedObjLockDays = sys.argv[sys.argv.index('-kr') + 1]
-    if '-ao' in sys.argv:
-        outputAlerts = sys.argv[sys.argv.index('-ao') + 1]
-    if '-ad' in sys.argv:
-        outputDeletedAlerts = sys.argv[sys.argv.index('-ad') + 1]
-    if '-om' in sys.argv:
-        objHistMaxSize = sys.argv[sys.argv.index('-om') + 1]
-    if '-oo' in sys.argv:
-        outputObjHist = sys.argv[sys.argv.index('-oo') + 1]
-    if '-lr' in sys.argv:
-        maxFreeLogsegments = sys.argv[sys.argv.index('-lr') + 1]
-    if '-eh' in sys.argv:
-        minRetainedDaysForHandledEvents = sys.argv[sys.argv.index('-eh') + 1]
-    if '-eu' in sys.argv:
-        minRetainedDaysForEvents = sys.argv[sys.argv.index('-eu') + 1]
-    if '-ur' in sys.argv:
-        retainedAuditLogDays = sys.argv[sys.argv.index('-ur') + 1]  
-    if '-pe' in sys.argv:
-        pendingEmailsDays = sys.argv[sys.argv.index('-pe') + 1]
-    if '-fl' in sys.argv:
-        fragmentationLimit = sys.argv[sys.argv.index('-fl') + 1]
-    if '-fo' in sys.argv:
-        outputFragmentation = sys.argv[sys.argv.index('-fo') + 1]
-    if '-rc' in sys.argv:
-        rcContainers = sys.argv[sys.argv.index('-rc') + 1]
-    if '-ro' in sys.argv:
-        outputRcContainers = sys.argv[sys.argv.index('-ro') + 1]
-    if '-cc' in sys.argv:
-        maxRawComp = sys.argv[sys.argv.index('-cc') + 1]
-    if '-ce' in sys.argv:
-        maxEstComp = sys.argv[sys.argv.index('-ce') + 1]
-    if '-cr' in sys.argv:
-        maxRowComp = sys.argv[sys.argv.index('-cr') + 1]    
-    if '-cs' in sys.argv:
-        maxMemComp = sys.argv[sys.argv.index('-cs') + 1]       
-    if '-cd' in sys.argv:
-        minDistComp = sys.argv[sys.argv.index('-cd') + 1]
-    if '-cq' in sys.argv:
-        maxQuotaComp = sys.argv[sys.argv.index('-cq') + 1]
-    if '-cu' in sys.argv:
-        maxUDIVComp = sys.argv[sys.argv.index('-cu') + 1]
-    if '-cb' in sys.argv:
-        maxBLOCKComp = sys.argv[sys.argv.index('-cb') + 1]
-    if '-cp' in sys.argv:
-        partComp = sys.argv[sys.argv.index('-cp') + 1]
-    if '-cm' in sys.argv:
-        mergeBeforeComp = sys.argv[sys.argv.index('-cm') + 1]
-    if '-co' in sys.argv:
-        outComp = sys.argv[sys.argv.index('-co') + 1]
-    if '-vs' in sys.argv:
-        createVTStat = sys.argv[sys.argv.index('-vs') + 1]
-    if '-vt' in sys.argv:
-        defaultVTStatType = sys.argv[sys.argv.index('-vt') + 1]    
-    if '-vn' in sys.argv:
-        maxRowsForDefaultVT = sys.argv[sys.argv.index('-vn') + 1] 
-    if '-vtt' in sys.argv:
-        largeVTStatType = sys.argv[sys.argv.index('-vtt') + 1]  
-    if '-vto' in sys.argv:
-        otherDBVTStatType = sys.argv[sys.argv.index('-vto') + 1]  
-    if '-vl' in sys.argv:
-        vtSchemas = [x for x in sys.argv[  sys.argv.index('-vl') + 1   ].split(',')]
-    if '-vr' in sys.argv:
-        ignore2ndMon = sys.argv[sys.argv.index('-vr') + 1]
-    if '-vnr' in sys.argv:
-        refreshAge = sys.argv[sys.argv.index('-vnr') + 1] 
-    if '-ir' in sys.argv:
-        minRetainedIniDays = sys.argv[sys.argv.index('-ir') + 1]
-    if '-es' in sys.argv:
-        execute_sql = sys.argv[sys.argv.index('-es') + 1]
-    if '-os' in sys.argv:
-        out_sql = sys.argv[sys.argv.index('-os') + 1]
-    if '-op' in sys.argv:
-        out_path = sys.argv[sys.argv.index('-op') + 1]
-    if '-of' in sys.argv:
-        out_prefix = sys.argv[sys.argv.index('-of') + 1]
-    if '-or' in sys.argv:
-        minRetainedOutputDays = sys.argv[sys.argv.index('-or') + 1]
-    if '-oi' in sys.argv:
-        online_test_interval = sys.argv[sys.argv.index('-oi') + 1]
-    if '-fs' in sys.argv:
-        file_system = sys.argv[sys.argv.index('-fs') + 1]
-    if '-if' in sys.argv:
-        ignore_filesystems = [x for x in sys.argv[  sys.argv.index('-if') + 1   ].split(',')]
-    if '-df' in sys.argv:
-        do_df_check = sys.argv[sys.argv.index('-df') + 1]
-    if '-hci' in sys.argv:
-        hanacleaner_interval = sys.argv[sys.argv.index('-hci') + 1]
-    if '-ff' in sys.argv:
-        flag_file = sys.argv[sys.argv.index('-ff') + 1]
-        flag_file = flag_file.replace('%SID', SID)
-    if '-so' in sys.argv:
-        std_out = sys.argv[sys.argv.index('-so') + 1]
-    if '-ssl' in sys.argv:
-        ssl = sys.argv[sys.argv.index('-ssl') + 1]
-    if '-vlh' in sys.argv:
-        virtual_local_host = sys.argv[sys.argv.index('-vlh') + 1]
-    if '-k' in sys.argv:
-        dbuserkeys = [x for x in sys.argv[  sys.argv.index('-k') + 1   ].split(',')]
-    if '-dbs' in sys.argv:
-        dbases = [x for x in sys.argv[  sys.argv.index('-dbs') + 1   ].split(',')]
-    if '-en' in sys.argv:
-        email_notif = [x for x in sys.argv[  sys.argv.index('-en') + 1   ].split(',')]
+            checkIfAcceptedFlag(word)
+    minRetainedBackups                = getParameterFromCommandLine(sys.argv, '-be', flag_log, minRetainedBackups)
+    minRetainedDays                   = getParameterFromCommandLine(sys.argv, '-bd', flag_log, minRetainedDays)
+    deleteBackups                     = getParameterFromCommandLine(sys.argv, '-bb', flag_log,  deleteBackups)
+    outputCatalog                     = getParameterFromCommandLine(sys.argv, '-bo', flag_log, outputCatalog)
+    outputDeletedCatalog              = getParameterFromCommandLine(sys.argv, '-br', flag_log, outputDeletedCatalog)
+    outputNDeletedLBEntries           = getParameterFromCommandLine(sys.argv, '-bn', flag_log, outputNDeletedLBEntries)
+    retainedTraceContentDays          = getParameterFromCommandLine(sys.argv, '-tc', flag_log, retainedTraceContentDays)
+    retainedExpensiveTraceContentDays = getParameterFromCommandLine(sys.argv, '-te', flag_log, retainedExpensiveTraceContentDays)
+    backupTraceContent                = getParameterFromCommandLine(sys.argv, '-tcb', flag_log, backupTraceContent)
+    backupTraceDirectory              = getParameterFromCommandLine(sys.argv, '-tbd', flag_log, backupTraceDirectory)
+    timeOutForMove                    = getParameterFromCommandLine(sys.argv, '-tmo', flag_log, timeOutForMove)
+    retainedTraceFilesDays            = getParameterFromCommandLine(sys.argv, '-tf', flag_log, retainedTraceFilesDays)
+    outputTraces                      = getParameterFromCommandLine(sys.argv, '-to', flag_log, outputTraces)
+    outputRemovedTraces               = getParameterFromCommandLine(sys.argv, '-td', flag_log, outputRemovedTraces)
+    retainedDumpDays                  = getParameterFromCommandLine(sys.argv, '-dr', flag_log, retainedDumpDays)
+    retainedAnyFileDays               = getParameterFromCommandLine(sys.argv, '-gr', flag_log, retainedAnyFileDays)
+    anyFilePaths                      = getParameterListFromCommandLine(sys.argv, '-gd', flag_log, anyFilePaths)
+    anyFilePaths                      = [p.replace('%SID', SID) for p in anyFilePaths]
+    anyFileWords                      = getParameterListFromCommandLine(sys.argv, '-gw', flag_log, anyFileWords)
+    anyFileMaxDepth                   = getParameterFromCommandLine(sys.argv, '-gm', flag_log, anyFileMaxDepth)
+    zipBackupLogsSizeLimit            = getParameterFromCommandLine(sys.argv, '-zb', flag_log, zipBackupLogsSizeLimit)
+    zipBackupPath                     = getParameterFromCommandLine(sys.argv, '-zp', flag_log, zipBackupPath)
+    zipLinks                          = getParameterFromCommandLine(sys.argv, '-zl', flag_log, zipLinks)
+    zipOut                            = getParameterFromCommandLine(sys.argv, '-zo', flag_log, zipOut)
+    zipKeep                           = getParameterFromCommandLine(sys.argv, '-zk', flag_log, zipKeep)
+    minRetainedAlertDays              = getParameterFromCommandLine(sys.argv, '-ar', flag_log, minRetainedAlertDays)
+    minRetainedObjLockDays            = getParameterFromCommandLine(sys.argv, '-kr', flag_log, minRetainedObjLockDays)
+    outputAlerts                      = getParameterFromCommandLine(sys.argv, '-ao', flag_log, outputAlerts)
+    outputDeletedAlerts               = getParameterFromCommandLine(sys.argv, '-ad', flag_log, outputDeletedAlerts)
+    objHistMaxSize                    = getParameterFromCommandLine(sys.argv, '-om', flag_log, objHistMaxSize)
+    outputObjHist                     = getParameterFromCommandLine(sys.argv, '-oo', flag_log, outputObjHist)
+    maxFreeLogsegments                = getParameterFromCommandLine(sys.argv, '-lr', flag_log, maxFreeLogsegments)
+    minRetainedDaysForHandledEvents   = getParameterFromCommandLine(sys.argv, '-eh', flag_log, minRetainedDaysForHandledEvents)
+    minRetainedDaysForEvents          = getParameterFromCommandLine(sys.argv, '-eu', flag_log, minRetainedDaysForEvents)
+    retainedAuditLogDays              = getParameterFromCommandLine(sys.argv, '-ur', flag_log, retainedAuditLogDays)
+    pendingEmailsDays                 = getParameterFromCommandLine(sys.argv, '-pe', flag_log, pendingEmailsDays)
+    fragmentationLimit                = getParameterFromCommandLine(sys.argv, '-fl', flag_log, fragmentationLimit)
+    outputFragmentation               = getParameterFromCommandLine(sys.argv, '-fo', flag_log, outputFragmentation)
+    rcContainers                      = getParameterFromCommandLine(sys.argv, '-rc', flag_log, rcContainers)
+    outputRcContainers                = getParameterFromCommandLine(sys.argv, '-ro', flag_log, outputRcContainers)
+    maxRawComp                        = getParameterFromCommandLine(sys.argv, '-cc', flag_log, maxRawComp)
+    maxEstComp                        = getParameterFromCommandLine(sys.argv, '-ce', flag_log, maxEstComp)
+    maxRowComp                        = getParameterFromCommandLine(sys.argv, '-cr', flag_log, maxRowComp)
+    maxMemComp                        = getParameterFromCommandLine(sys.argv, '-cs', flag_log, maxMemComp)
+    minDistComp                       = getParameterFromCommandLine(sys.argv, '-cd', flag_log, minDistComp)
+    maxQuotaComp                      = getParameterFromCommandLine(sys.argv, '-cq', flag_log, maxQuotaComp)
+    maxUDIVComp                       = getParameterFromCommandLine(sys.argv, '-cu', flag_log, maxUDIVComp)
+    maxBLOCKComp                      = getParameterFromCommandLine(sys.argv, '-cb', flag_log, maxBLOCKComp)
+    partComp                          = getParameterFromCommandLine(sys.argv, '-cp', flag_log, partComp)
+    mergeBeforeComp                   = getParameterFromCommandLine(sys.argv, '-cm', flag_log, mergeBeforeComp)
+    outComp                           = getParameterFromCommandLine(sys.argv, '-co', flag_log, outComp)
+    createVTStat                      = getParameterFromCommandLine(sys.argv, '-vs', flag_log, createVTStat)
+    maxColumnsOfVT                    = getParameterFromCommandLine(sys.argv, '-vm', flag_log, maxColumnsOfVT)
+    defaultVTStatType                 = getParameterFromCommandLine(sys.argv, '-vt', flag_log, defaultVTStatType)
+    maxRowsForDefaultVT               = getParameterFromCommandLine(sys.argv, '-vn', flag_log, maxRowsForDefaultVT)
+    largeVTStatType                   = getParameterFromCommandLine(sys.argv, '-vtt', flag_log, largeVTStatType)
+    otherDBVTStatType                 = getParameterFromCommandLine(sys.argv, '-vto', flag_log, otherDBVTStatType)
+    vtSchemas                         = getParameterListFromCommandLine(sys.argv, '-vl', flag_log, vtSchemas)
+    ignore2ndMon                      = getParameterFromCommandLine(sys.argv, '-vr', flag_log, ignore2ndMon)
+    refreshAge                        = getParameterFromCommandLine(sys.argv, '-vnr', flag_log, refreshAge)
+    minRetainedIniDays                = getParameterFromCommandLine(sys.argv, '-ir', flag_log, minRetainedIniDays)
+    execute_sql                       = getParameterFromCommandLine(sys.argv, '-es', flag_log, execute_sql)
+    out_sql                           = getParameterFromCommandLine(sys.argv, '-os', flag_log, out_sql)
+    out_path                          = getParameterFromCommandLine(sys.argv, '-op', flag_log, out_path)
+    out_prefix                        = getParameterFromCommandLine(sys.argv, '-of', flag_log, out_prefix)
+    minRetainedOutputDays             = getParameterFromCommandLine(sys.argv, '-or', flag_log, minRetainedOutputDays)
+    out_config                        = getParameterFromCommandLine(sys.argv, '-oc', flag_log, out_config)
+    online_test_interval              = getParameterFromCommandLine(sys.argv, '-oi', flag_log, online_test_interval)
+    file_system                       = getParameterFromCommandLine(sys.argv, '-fs', flag_log, file_system)
+    ignore_filesystems                = getParameterListFromCommandLine(sys.argv, '-if', flag_log, ignore_filesystems)
+    do_df_check                       = getParameterFromCommandLine(sys.argv, '-df', flag_log, do_df_check)
+    hanacleaner_interval              = getParameterFromCommandLine(sys.argv, '-hci', flag_log, hanacleaner_interval)
+    std_out                           = getParameterFromCommandLine(sys.argv, '-so', flag_log, std_out)
+    ssl                               = getParameterFromCommandLine(sys.argv, '-ssl', flag_log, ssl)
+    virtual_local_host                = getParameterFromCommandLine(sys.argv, '-vlh', flag_log, virtual_local_host)
+    dbuserkeys                        = getParameterListFromCommandLine(sys.argv, '-k', flag_log, dbuserkeys)
+    dbases                            = getParameterListFromCommandLine(sys.argv, '-dbs', flag_log, dbases)
+    receiver_emails                   = getParameterListFromCommandLine(sys.argv, '-en', flag_log, receiver_emails)
+    email_timeout                     = getParameterFromCommandLine(sys.argv, '-et', flag_log, email_timeout)
+    sendEmailSummary                  = getParameterFromCommandLine(sys.argv, '-ena', flag_log, sendEmailSummary)
+    email_client                      = getParameterFromCommandLine(sys.argv, '-enc', flag_log, email_client)
+    senders_email                     = getParameterFromCommandLine(sys.argv, '-ens', flag_log, senders_email)
+    mail_server                       = getParameterFromCommandLine(sys.argv, '-enm', flag_log, mail_server)
 
     ############ GET LOCAL HOST ##########
-    local_host = subprocess.check_output("hostname", shell=True).replace('\n','') if virtual_local_host == "" else virtual_local_host   
+    local_host = run_command("hostname").replace('\n','') if virtual_local_host == "" else virtual_local_host 
+    local_host = local_host.replace(' ', '')  
+    if not is_integer(local_host.split('.')[0]):    #first check that it is not an IP address
+        local_host = local_host.split('.')[0]  #if full host name is specified in the local host (or virtual host), only the first part is used
+    ############ CHECK EMAIL FLAGS #######
+    ### receiver_emails, -en
+    if receiver_emails:
+        if any(not is_email(element) for element in receiver_emails):
+            print("INPUT ERROR: some element(s) of -en is/are not email(s). Please see --help for more information.")
+            os._exit(1)
+    ### email_timeout, -et
+    if not is_integer(email_timeout):
+        print("INPUT ERROR: -et must be an integer. Please see --help for more information.")
+        os._exit(1)
+    email_timeout = int(email_timeout)
+    if email_timeout >= 0 and not receiver_emails:
+        print("INPUT ERROR: -et is specified although -en is not, this makes no sense. Please see --help for more information.")
+        os._exit(1)
+    ### sendEmailSummary, -ena
+    sendEmailSummary = checkAndConvertBooleanFlag(sendEmailSummary, "-ena")
+    if sendEmailSummary:
+        if not receiver_emails:
+            print("INPUT ERROR: -ena is true although -en is not specified, this makes no sense. Please see --help for more information.")
+            os._exit(1)
+    ### email_client, -enc
+    if email_client:
+        if not receiver_emails:
+            print("INPUT ERROR: -enc is specified although -en is not, this makes no sense. Please see --help for more information.")
+            os._exit(1)
+    if receiver_emails:
+        if not email_client:
+            email_client = 'mailx'
+        if email_client not in ['mailx', 'mail', 'mutt']:
+            print("INPUT ERROR: The -enc flag does not specify any of the email clients mailx, mail, or mutt. If you are using another email client that can send emails with the command ")
+            print('             <message> | <client> -s "<subject>" \n please let me know.')
+            os._exit(1)
+    ### senders_email, -ens
+    if senders_email:
+        if not receiver_emails:
+            print("INPUT ERROR: -ens is specified although -en is not, this makes no sense. Please see --help for more information.")
+            os._exit(1)
+        if not is_email(senders_email):
+            print("INPUT ERROR: -ens is not an email. Please see --help for more information.")
+            os._exit(1)
+    ### mail_server, -enm
+    if mail_server:
+        if not receiver_emails:
+            print("INPUT ERROR: -enm is specified although -en is not, this makes no sense. Please see --help for more information.")
+            os._exit(1)
+    emailSender = None
+    if receiver_emails:
+        emailSender = EmailSender(receiver_emails, email_client, senders_email, mail_server, SID)
 
     ############# STD OUT, LOG DIRECTORY and LOG MANAGER #########
-    std_out = checkAndConvertBooleanFlag(std_out, "-so", LogManager("", "", True))
+    std_out = checkAndConvertBooleanFlag(std_out, "-so", LogManager("", "", True, emailSender))
     log_path = out_path.replace(" ","_").replace(".","_")
     log_path = log_path.replace('%SID', SID)     
     if log_path and not os.path.exists(log_path):
         os.makedirs(log_path)
-    logman = LogManager(log_path, out_prefix, std_out)
+    logman = LogManager(log_path, out_prefix, std_out, emailSender)
 
     ############ CHECK FOR DISK FULL SITUATION ###################
     ### do_df_check, -df
     do_df_check = checkAndConvertBooleanFlag(do_df_check, "-df", logman)
     if do_df_check:
         if max_filesystem_usage_in_percent(file_system, ignore_filesystems, logman) > 98:
-            log('ERROR: HANACleaner is not supported during a "disk full situation". Currently one of your filesystem is using more than 98% of available disk space. Please solve this issue and then run HANACleaner again.', logman)
+            log('ERROR: HANACleaner is not supported during a "disk full situation". Currently one of your filesystem is using more than 98% of available disk space. Please solve this issue and then run HANACleaner again.', logman, True)
             os._exit(1)
 
     ############ CHECK AND CONVERT INPUT PARAMETERS #################
@@ -3611,19 +3666,19 @@ def main():
         os._exit(1)
     minRetainedBackups = int(minRetainedBackups)
     if minRetainedBackups == 0:
-        log("INPUT ERROR: -be is not allowed to be 0, we must keep at least one data backup entry. Please see --help for more information.", logman)
+        log("INPUT ERROR: -be is not allowed to be 0, we must keep at least one data backup entry. Please see --help for more information.", logman, True)
         os._exit(1)
     if minRetainedBackups < 0:
         minRetainedBackups = -1
     ### minRetainedDays, -bd
     if not is_integer(minRetainedDays):
-        log("INPUT ERROR: -bd must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -bd must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedDays = int(minRetainedDays)
     # deleteBackups, -bb
     deleteBackups = checkAndConvertBooleanFlag(deleteBackups, "-bb", logman)    
     if deleteBackups and (minRetainedBackups < 0 and minRetainedDays < 0):
-        log("INPUT ERROR: If -bb is 'true' then -be and -bd cannot both be '-1'. Please see --help for more information.", logman)
+        log("INPUT ERROR: If -bb is 'true' then -be and -bd cannot both be '-1'. Please see --help for more information.", logman, True)
         os._exit(1)
     ### outputCatalog, -bo
     outputCatalog = checkAndConvertBooleanFlag(outputCatalog, "-bo", logman)
@@ -3646,63 +3701,63 @@ def main():
     ### backupTraceContent, -tcb
     backupTraceContent = checkAndConvertBooleanFlag(backupTraceContent, "-tcb", logman)
     if backupTraceContent and (retainedTraceContentDays == "-1" and retainedExpensiveTraceContentDays == "-1"):
-        log("INPUT ERROR: -tcb is specified although -tc and -te are not. This makes no sense. Please see --help for more information.", logman)
+        log("INPUT ERROR: -tcb is specified although -tc and -te are not. This makes no sense. Please see --help for more information.", logman, True)
         os._exit(1)
     ### backupTraceDirectory, -tbd
     if backupTraceDirectory and not backupTraceContent:
-        log("INPUT ERROR: -tbd is specified although -tcb is not. This makes no sense. Please see --help for more information.", logman)
+        log("INPUT ERROR: -tbd is specified although -tcb is not. This makes no sense. Please see --help for more information.", logman, True)
         os._exit(1)
     ### timeOutForMove, -tmo
     if not is_integer(timeOutForMove):
-        log("INPUT ERROR: -tmo must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -tmo must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     timeOutForMove = int(timeOutForMove)
     ### retainedTraceFilesDays, -tf
     if not is_integer(retainedTraceFilesDays):
-        log("INPUT ERROR: -tf must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -tf must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     if outputRemovedTraces:
         if retainedTraceContentDays == "-1" and retainedExpensiveTraceContentDays == "-1" and retainedTraceFilesDays == "-1":
-            log("INPUT ERROR: -td is true allthough -tc, -te and -tf are all -1. This makes no sense. Please see --help for more information.", logman)
+            log("INPUT ERROR: -td is true allthough -tc, -te and -tf are all -1. This makes no sense. Please see --help for more information.", logman, True)
             os._exit(1)
     ### retainedDumpDays, -dr
     if not is_integer(retainedDumpDays):
-        log("INPUT ERROR: -dr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -dr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     ### retainedAnyFileDays, -gr
     if not is_integer(retainedAnyFileDays):
-        log("INPUT ERROR: -gr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -gr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     ### anyFilePaths, -gd
     if anyFilePaths[0]:
         if not all(os.path.isdir(path) for path in anyFilePaths):
-            log("INPUT ERROR: -gd must be a directory or a list of directories. Please see --help for more information.", logman)
+            log("INPUT ERROR: -gd must be a directory or a list of directories. Please see --help for more information.", logman, True)
             os._exit(1)
     ### anyFileWords, -gw
     if not len(anyFileWords) == len(anyFilePaths):
-        log("INPUT ERROR: -gw must be a list of the same length as -gd. Please see --help for more information.", logman)
+        log("INPUT ERROR: -gw must be a list of the same length as -gd. Please see --help for more information.", logman, True)
         os._exit(1)
     if len(anyFileWords) == 1 and anyFileWords[0] == "" and not retainedAnyFileDays == "-1":
-        log("INPUT ERROR: -gw must be specified if -gr is. Please see --help for more information.", logman)
+        log("INPUT ERROR: -gw must be specified if -gr is. Please see --help for more information.", logman, True)
         os._exit(1)
     ### anyFileMaxDepth, -gm
     if not is_integer(anyFileMaxDepth):
-        log("INPUT ERROR: -gm must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -gm must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     anyFileMaxDepth = int(anyFileMaxDepth)
     if anyFileMaxDepth < 1 or anyFileMaxDepth > 10:
-        log("INPUT ERROR: -gm must be between 1 and 10. Please see --help for more information.", logman)
+        log("INPUT ERROR: -gm must be between 1 and 10. Please see --help for more information.", logman, True)
         os._exit(1)
     ### zipBackupLogsSizeLimit, -zb
     if not is_integer(zipBackupLogsSizeLimit):
-        log("INPUT ERROR: -zb must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -zb must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)       
     zipBackupLogsSizeLimit = int(zipBackupLogsSizeLimit)
     if zipBackupLogsSizeLimit != -1:
         ### zipBackupPath, -zp
         if zipBackupPath: #default has been put to '' and will be put to cdtrace as soon as we get local_instance
             if not os.path.exists(zipBackupPath):
-                log("INPUT ERROR: The path provided with -zp does not exist. Please see --help for more information.\n"+zipBackupPath, logman)
+                log("INPUT ERROR: The path provided with -zp does not exist. Please see --help for more information.\n"+zipBackupPath, logman, True)
                 os._exit(1)
     ### zipLinks, -zl
     zipLinks = checkAndConvertBooleanFlag(zipLinks, "-zl", logman)
@@ -3712,12 +3767,12 @@ def main():
     zipKeep = checkAndConvertBooleanFlag(zipKeep, "-zk", logman)
     ### minRetainedAlertDays, -ar
     if not is_integer(minRetainedAlertDays):
-        log("INPUT ERROR: -ar must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -ar must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedAlertDays = int(minRetainedAlertDays)
     ### minRetainedObjLockDays, -kr
     if not is_integer(minRetainedObjLockDays):
-        log("INPUT ERROR: -kr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -kr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedObjLockDays = int(minRetainedObjLockDays)
     ### outputAlerts, -ao
@@ -3726,40 +3781,40 @@ def main():
     outputDeletedAlerts = checkAndConvertBooleanFlag(outputDeletedAlerts, "-ad", logman)
     ### objHistMaxSize, -om
     if not is_integer(objHistMaxSize):
-        log("INPUT ERROR: -om must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -om must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)    
     objHistMaxSize = int(objHistMaxSize)
     ### outputObjHist, -oo
     outputObjHist = checkAndConvertBooleanFlag(outputObjHist, "-oo", logman)    
     ### maxFreeLogsegments, -lr 
     if not is_integer(maxFreeLogsegments):
-        log("INPUT ERROR: -lr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -lr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxFreeLogsegments = int(maxFreeLogsegments)
     ### minRetainedDaysForHandledEvents, -eh
     if not is_integer(minRetainedDaysForHandledEvents):
-        log("INPUT ERROR: -eh must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -eh must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedDaysForHandledEvents = int(minRetainedDaysForHandledEvents) 
     ### minRetainedDaysForEvents, -eu
     if not is_integer(minRetainedDaysForEvents):
-        log("INPUT ERROR: -eu must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -eu must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedDaysForEvents = int(minRetainedDaysForEvents)
     if minRetainedDaysForHandledEvents >= 0 and minRetainedDaysForEvents >= 0 and minRetainedDaysForHandledEvents > minRetainedDaysForEvents:
-        log("INPUT ERROR: it does not make sense that -eh > -eu. Please see --help for more information.", logman)
+        log("INPUT ERROR: it does not make sense that -eh > -eu. Please see --help for more information.", logman, True)
         os._exit(1)
     ### retainedAuditLogDays, -ur
     if not is_integer(retainedAuditLogDays):
-        log("INPUT ERROR: -ur must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -ur must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)    
     ### pendingEmailsDays, -pe
     if not is_integer(pendingEmailsDays):
-        log("INPUT ERROR: -pe must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -pe must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     ### fragmentationLimit, -fl
     if not is_integer(fragmentationLimit):
-        log("INPUT ERROR: -fl must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -fl must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     fragmentationLimit = int(fragmentationLimit)
     ### outputFragmentation, -fo
@@ -3770,42 +3825,42 @@ def main():
     outputRcContainers = checkAndConvertBooleanFlag(outputRcContainers, "-ro", logman)
     ### maxRawComp, -cc
     if not is_integer(maxRawComp):
-        log("INPUT ERROR: -cc must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cc must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxRawComp = int(maxRawComp)
     ### maxEstComp, -ce
     if not is_integer(maxEstComp):
-        log("INPUT ERROR: -ce must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -ce must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxEstComp = int(maxEstComp)
     ### maxRowComp, -cr
     if not is_integer(maxRowComp):
-        log("INPUT ERROR: -cr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxRowComp = int(maxRowComp)
     ### maxMemComp, -cs
     if not is_integer(maxMemComp):
-        log("INPUT ERROR: -cs must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cs must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxMemComp = int(maxMemComp)
     ### minDistComp, -cd
     if not is_integer(minDistComp):
-        log("INPUT ERROR: -cd must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cd must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minDistComp = int(minDistComp)
     ### maxQuotaComp, -cq
     if not is_integer(maxQuotaComp):
-        log("INPUT ERROR: -cq must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cq must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxQuotaComp = int(maxQuotaComp)    
     ### maxUDIVComp, -cu
     if not is_integer(maxUDIVComp):
-        log("INPUT ERROR: -cu must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cu must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxUDIVComp = int(maxUDIVComp)
     ### maxBLOCKComp, -cb
     if not is_integer(maxBLOCKComp):
-        log("INPUT ERROR: -cb must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -cb must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxBLOCKComp = int(maxBLOCKComp)
     ### partComp, -cp
@@ -3816,26 +3871,31 @@ def main():
     outComp = checkAndConvertBooleanFlag(outComp, "-co", logman)
     ### createVTStat, -vs
     createVTStat = checkAndConvertBooleanFlag(createVTStat, "-vs", logman)
+    ### maxColumnsOfVT, -vm
+    if not is_integer(maxColumnsOfVT):
+        log("INPUT ERROR: -vm must be an integer. Please see --help for more information.", logman, True)
+        os._exit(1)
+    maxColumnsOfVT = int(maxColumnsOfVT)
     ### defaultVTStatType, -vt
     if defaultVTStatType not in ['HISTOGRAM', 'SIMPLE', 'TOPK', 'SKETCH', 'SAMPLE', 'RECORD_COUNT']:
-        log("INPUT ERROR: Wrong input option of -vt. Please see --help for more information.", logman)
+        log("INPUT ERROR: Wrong input option of -vt. Please see --help for more information.", logman, True)
         os._exit(1)
     if defaultVTStatType == 'RECORD_COUNT':
         defaultVTStatType = 'RECORD COUNT'
     ### maxRowsForDefaultVT, -vn
     if not is_integer(maxRowsForDefaultVT):
-        log("INPUT ERROR: -vn must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -vn must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     maxRowsForDefaultVT = int(maxRowsForDefaultVT)
     ### largeVTStatType, -vtt
     if largeVTStatType not in ['HISTOGRAM', 'SIMPLE', 'TOPK', 'SKETCH', 'SAMPLE', 'RECORD_COUNT']:
-        log("INPUT ERROR: Wrong input option of -vtt. Please see --help for more information.", logman)
+        log("INPUT ERROR: Wrong input option of -vtt. Please see --help for more information.", logman, True)
         os._exit(1)
     if largeVTStatType == 'RECORD_COUNT':
         largeVTStatType = 'RECORD COUNT'
     ### otherDBVTStatType, -vto
     if otherDBVTStatType not in ['HISTOGRAM', 'SIMPLE', 'TOPK', 'SKETCH', 'SAMPLE', 'RECORD_COUNT', '']:
-        log("INPUT ERROR: Wrong input option of -vto. Please see --help for more information.", logman)
+        log("INPUT ERROR: Wrong input option of -vto. Please see --help for more information.", logman, True)
         os._exit(1)
     if otherDBVTStatType == 'RECORD_COUNT':
         otherDBVTStatType = 'RECORD COUNT'
@@ -3845,20 +3905,20 @@ def main():
     ignore2ndMon = checkAndConvertBooleanFlag(ignore2ndMon, "-vr", logman)
     ### refreshAge, -vnr
     if not is_integer(refreshAge):
-        log("INPUT ERROR: -vnr must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -vnr must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     refreshAge = int(refreshAge)
     ### minRetainedIniDays, -ir
     if not is_integer(minRetainedIniDays):
-        log("INPUT ERROR: -ir must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -ir must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedIniDays = int(minRetainedIniDays)
     if minRetainedIniDays < 365 and minRetainedIniDays != -1:
-        log("INPUT ERROR: -ir must be larger than 365. Please see --help for more information. (If you disagree please remove this check on your own risk.)", logman)
+        log("INPUT ERROR: -ir must be larger than 365. Please see --help for more information. (If you disagree please remove this check on your own risk.)", logman, True)
         os._exit(1)
     ### hanacleaner_interval, -hci
     if not is_integer(hanacleaner_interval):
-        log("INPUT ERROR: -hci must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -hci must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     hanacleaner_interval = int(hanacleaner_interval)*24*3600  # days to seconds
     ### execute_sql, -es
@@ -3867,57 +3927,43 @@ def main():
     out_sql = checkAndConvertBooleanFlag(out_sql, "-os", logman)
     ### minRetainedOutputDays, -or
     if not is_integer(minRetainedOutputDays):
-        log("INPUT ERROR: -or must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -or must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     minRetainedOutputDays = int(minRetainedOutputDays)
     if minRetainedOutputDays >= 0 and out_path == "":
-        log("INPUT ERROR: -op has to be specified if -or is. Please see --help for more information.", logman)
+        log("INPUT ERROR: -op has to be specified if -or is. Please see --help for more information.", logman, True)
         os._exit(1)
+    ### out_config, -oc
+    out_config = checkAndConvertBooleanFlag(out_config, "-oc", logman)
     ### online_test_interval, -oi
     if not is_integer(online_test_interval):
-        log("INPUT ERROR: -oi must be an integer. Please see --help for more information.", logman)
+        log("INPUT ERROR: -oi must be an integer. Please see --help for more information.", logman, True)
         os._exit(1)
     online_test_interval = int(online_test_interval)
     ### dbases, -dbs, and dbuserkeys, -k
     if len(dbases) > 1 and len(dbuserkeys) > 1:
-        log("INPUT ERROR: -k may only specify one key if -dbs is used. Please see --help for more information.", logman)
-        os._exit(1)               
-    ### email_notif, -en
-    if email_notif:  # allow to be empty
-        if not len(email_notif) == 3:
-            print "INPUT ERROR: -en requires 3 elements, seperated by a comma. Please see --help for more information."
-            os._exit(1)
-        if not is_email(email_notif[0]) or not is_email(email_notif[1]) :
-            print "INPUT ERROR: first and second element of -en has to be valid emails. Please see --help for more information."
-            os._exit(1) 
-    emailSender = None
-    if email_notif:
-        emailSender = EmailSender(email_notif[0], email_notif[1], email_notif[2])
-    
+        log("INPUT ERROR: -k may only specify one key if -dbs is used. Please see --help for more information.", logman, True)
+        os._exit(1)
+    ### dbases, option with all data bases: -dbs all (-k must point to systemdb)
+    if len(dbases) == 1 and len(dbuserkeys) == 1 and 'all' in dbases:
+        dbuserkey = dbuserkeys[0]
+        dbases = get_all_databases(execute_sql, hdbsql_string, dbuserkey, local_host, out_sql, logman)   
+
     ################ START #################
     while True: # hanacleaner intervall loop
-        for dbuserkey in dbuserkeys:  
+        for dbuserkey in dbuserkeys:
+            ################ SET TIMEOUT ALARM #############
+            def timeout_handler(signum, frame):
+                log('Warning: HANACleaner has been running longer than '+str(email_timeout)+' seconds.', logman, True)
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(email_timeout)
             ############ GET LOCAL INSTANCE and SID ##########
-            try:
-                key_environment = subprocess.check_output('''hdbuserstore LIST '''+dbuserkey, shell=True) 
-            except:
-                log("ERROR, the key "+dbuserkey+" is not maintained in hdbuserstore.", logman)
-                os._exit(1)
-            key_environment = key_environment.split('\n')
-            key_environment = [ke for ke in key_environment if ke]
-            ENV = key_environment[1].replace('  ENV : ','').replace(';',',').split(',')
-            key_hosts = [env.split(':')[0].split('.')[0] for env in ENV]  #if full host name is specified in the Key, only the first part is used 
-            DATABASE = ''
-            if len(key_environment) == 4:   # if DATABASE is specified in the key, this will by used in the SQLManager (but if -dbs is specified, -dbs wins, see below)
-                DATABASE = key_environment[3].replace('  DATABASE: ','').replace(' ', '')
-            if not local_host in key_hosts:
-                print "ERROR, local host, ", local_host, ", should be one of the hosts specified for the key, ", dbuserkey, " (in case of virtual, please use -vlh, see --help for more info)"
-                os._exit(1)
+            [key_hosts, ENV, DATABASE] = get_key_info(dbuserkey, local_host, logman)
             local_host_index = key_hosts.index(local_host)
             key_sqlports = [env.split(':')[1] for env in ENV]        
             dbinstances = [port[1:3] for port in key_sqlports]
             if not all(x == dbinstances[0] for x in dbinstances):
-                print "ERROR: The hosts provided with the user key, "+dbuserkey+", does not all have the same instance number"
+                print("ERROR: The hosts provided with the user key, "+dbuserkey+", does not all have the same instance number")
                 os._exit(1)
             local_dbinstance = dbinstances[local_host_index]
             ############# MULTIPLE DATABASES #######
@@ -3930,18 +3976,29 @@ def main():
                 db_string = ''
                 if DATABASE:
                     db_string = 'on DB '+DATABASE
-                whoami = subprocess.check_output('whoami', shell=True).replace('\n','')
+                whoami = run_command('whoami').replace('\n','')
+                parameter_string = ""
+                if out_config:
+                    parameter_string = "\n".join("{}\t{}".format(k, "= "+v[0]+" from "+v[1]) for k, v in flag_log.items())
                 if sqlman.execute:
-                    startstring = "***********************************************************\n"+datetime.now().strftime("%Y-%m-%d %H:%M:%S")+"\nhanacleaner as "+whoami+" by "+dbuserkey+" on "+SID+"("+local_dbinstance+") "+db_string+" with \n"+" ".join(sys.argv)+"\nCleanup Statements will be executed (-es is default true)\nBefore using HANACleaner read the disclaimer!\npython hanacleaner.py --disclaimer\n***********************************************************" 
+                    startstring = "*********************************************************************************************************\n"+datetime.now().strftime("%Y-%m-%d %H:%M:%S")+"\nhanacleaner as "+whoami+" by "+dbuserkey+" on "+SID+"("+local_dbinstance+") "+db_string+" with \n"+" ".join(sys.argv)+"\nCleanup Statements will be executed (-es is default true)\n"+parameter_string+"\n ANY USAGE OF HANACLEANER ASSUMES THAT YOU HAVE READ AND UNDERSTOOD THE DISCLAIMER!\n    python hanacleaner.py --disclaimer\n\n*********************************************************************************************************" 
                 else:
-                    startstring = "*********************************************\n"+datetime.now().strftime("%Y-%m-%d %H:%M:%S")+"\nhanacleaner as "+whoami+" by "+dbuserkey+"\non "+SID+"("+local_dbinstance+") "+db_string+" with \n"+" ".join(sys.argv)+"\nCleanup Statements will NOT be executed\nBefore using HANACleaner read the disclaimer!\npython hanacleaner.py --disclaimer\n*********************************************"
+                    startstring = "*******************************************************************************************\n"+datetime.now().strftime("%Y-%m-%d %H:%M:%S")+"\nhanacleaner as "+whoami+" by "+dbuserkey+"\non "+SID+"("+local_dbinstance+") "+db_string+" with \n"+" ".join(sys.argv)+"\nCleanup Statements will NOT be executed\n"+parameter_string+" \n ANY USAGE OF HANACLEANER ASSUMES THAT YOU HAVE READ AND UNDERSTOOD THE DISCLAIMER!\n    python hanacleaner.py --disclaimer\n\n*******************************************************************************************"
                 log(startstring, logman)
                 emailmessage += startstring+"\n"
                 ############ ONLINE TESTS (OPTIONAL) ##########################
                 while not online_and_master_tests(online_test_interval, local_dbinstance, local_host, logman):  #will check if Online and if Primary and not Stand-By, and then if Master, but only if online_test_interval > -1           
                     log("\nOne of the online checks found out that this HANA instance, "+str(local_dbinstance)+", is not online or not master. ", logman)
+                    ############ CLEANUP of OWN LOGS, HANACLEANER MUST DO even though HANA is OFFLINE ##########################
+                    if minRetainedOutputDays >= 0:
+                        nCleaned = clean_output(minRetainedOutputDays, sqlman, logman)
+                        logmessage = str(nCleaned)+" hanacleaner daily log files were removed (-or) even though HANA is offline"
+                        log(logmessage, logman)
+                        emailmessage += logmessage+"\n"
+                    else:
+                        log("    (Cleaning of the hanacleaner logs was not done since -or was negative (or not specified))", logman)  
                     if online_test_interval == 0:
-                        log("HANACleaner will now abort since online_test_interval = 0.", logman)
+                        log("HANACleaner will now abort since online_test_interval = 0.", logman, True)
                         os._exit(1)
                     else:
                         log("HANACleaner will now have a "+str(online_test_interval)+" seconds break and check again if this Instance is online, or master, after the break.\n", logman)
@@ -3949,15 +4006,15 @@ def main():
                 ############ CHECK THAT USER CAN CONNECT TO HANA ###############  
                 sql = "SELECT * from DUMMY" 
                 errorlog = "USER ERROR: The user represented by the key "+dbuserkey+" cannot connect to the system. Make sure this user is properly saved in hdbuserstore."
-                [dummy_out, succeeded] = try_execute_sql(sql, errorlog, sqlman, logman)
+                [dummy_out, succeeded] = try_execute_sql(sql, errorlog, sqlman, logman, True, True) # always check key, even if -es true
                 dummy_out = dummy_out.strip("\n").strip("|").strip(" ") 
                 if sqlman.execute and (dummy_out != 'X' or not succeeded):
-                    log("USER ERROR: The user represented by the key "+dbuserkey+" cannot connect to the system. Make sure this user is properly saved in hdbuserstore.", logman)
+                    log("USER ERROR: The user represented by the key "+dbuserkey+" cannot connect to the system. Make sure this user is properly saved in hdbuserstore.", logman, True)
                     os._exit(1)
                 ##### HANA VERSION COMPATABILITY ######    
                 [version, revision, mrevision] = hana_version_revision_maintenancerevision(sqlman, logman)
                 if (retainedTraceContentDays != "-1" or retainedExpensiveTraceContentDays != "-1") and (version < 2 and revision < 120):
-                    log("VERSION ERROR: -tc and -te are not supported for SAP HANA rev. < 120. (The UNTIL option is new with SPS12.)", logman)
+                    log("VERSION ERROR: -tc and -te are not supported for SAP HANA rev. < 120. (The UNTIL option is new with SPS12.)", logman, True)
                     os._exit(1)       
                 if zipBackupLogsSizeLimit != -1 and (version >= 2 and revision >= 40):
                     log("VERSION WARNING: -zb is not supported for SAP HANA 2 rev. >= 40. Instead configure size with parameters, see SAP Note 2797078.", logman)
@@ -3965,8 +4022,8 @@ def main():
                 ###### START ALL HOUSE KEEPING TASKS ########
                 if minRetainedBackups >= 0 or minRetainedDays >= 0:
                     [nCleanedData, nCleanedLog] = clean_backup_catalog(minRetainedBackups, minRetainedDays, deleteBackups, outputCatalog, outputDeletedCatalog, outputNDeletedLBEntries, sqlman, logman)
-                    logmessage = str(nCleanedData)+" data backup entries and "+str(nCleanedLog)+" log backup entries were removed from the backup catalog"
-                    if outputNDeletedLBEntries:
+                    logmessage = str(nCleanedData)+" data backup entries and "+str(nCleanedLog)+" log backup entries were removed from the backup catalog (-be and -bd)"
+                    if not outputNDeletedLBEntries:
                         logmessage = str(nCleanedData)+" data backup entries were removed from the backup catalog (number removed log backups is unknown since -bn = false)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
@@ -3974,21 +4031,21 @@ def main():
                     log("    (Cleaning of the backup catalog was not done since -be and -bd were both negative (or not specified))", logman)
                 if retainedTraceContentDays != "-1" or retainedExpensiveTraceContentDays != "-1" or retainedTraceFilesDays != "-1":
                     nCleaned = clean_trace_files(retainedTraceContentDays, retainedExpensiveTraceContentDays, backupTraceContent, backupTraceDirectory, timeOutForMove, retainedTraceFilesDays, outputTraces, outputRemovedTraces, SID, DATABASE, local_dbinstance, hosts(sqlman), sqlman, logman)
-                    logmessage = str(nCleaned)+" trace files were removed"
+                    logmessage = str(nCleaned)+" trace files were removed (-tc and -tf)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning traces was not done since -tc and -tf were both -1 (or not specified))", logman)
                 if retainedDumpDays != "-1":
                     nCleaned = clean_dumps(retainedDumpDays, local_dbinstance, sqlman, logman)
-                    logmessage = str(nCleaned)+" fullsysteminfodump zip files (that can contain both fullsystem dumps and runtime dumps) were removed"
+                    logmessage = str(nCleaned)+" fullsysteminfodump zip files (that can contain both fullsystem dumps and runtime dumps) were removed (-dr)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning dumps was not done since -dr was -1 (or not specified))", logman)
                 if retainedAnyFileDays != "-1":
                     nCleaned = clean_anyfile(retainedAnyFileDays, anyFilePaths, anyFileWords, anyFileMaxDepth, sqlman, logman)
-                    logmessage = str(nCleaned)+" general files were removed"
+                    logmessage = str(nCleaned)+" general files were removed (-gr)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
@@ -3997,56 +4054,56 @@ def main():
                     if not zipBackupPath:
                         zipBackupPath = cdalias('cdtrace', local_dbinstance)
                     nZipped = zipBackupLogs(zipBackupLogsSizeLimit, zipBackupPath, zipLinks, zipOut, zipKeep, sqlman, logman)
-                    logmessage = str(nZipped)+" backup logs were compressed"
+                    logmessage = str(nZipped)+" backup logs were compressed (-zb)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Compression of the backup logs was not done since -zb was negative (or not specified) or this is not more supported for your HANA Version)", logman)
                 if minRetainedAlertDays >= 0:
                     nCleaned = clean_alerts(minRetainedAlertDays, outputAlerts, outputDeletedAlerts, sqlman, logman)
-                    logmessage = str(nCleaned)+" alerts were removed"
+                    logmessage = str(nCleaned)+" alerts were removed (-ar)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning of the alerts was not done since -ar was negative (or not specified))", logman)
                 if minRetainedObjLockDays >= 0:
                     nCleaned = clean_objlock(minRetainedObjLockDays, sqlman, logman)
-                    logmessage = str(nCleaned)+" object locks entries with unknown object names were removed"
+                    logmessage = str(nCleaned)+" object locks entries with unknown object names were removed (-kr)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning of unknown object locks entries was not done since -kr was negative (or not specified))", logman)
                 if objHistMaxSize >= 0:
                     memoryCleaned = clean_objhist(objHistMaxSize, outputObjHist, sqlman, logman)
-                    logmessage = str(memoryCleaned)+" mb were cleaned from object history"
+                    logmessage = str(memoryCleaned)+" mb were cleaned from object history (-om)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning of the object history was not done since -om was negative (or not specified))", logman)
                 if maxFreeLogsegments >= 0:
                     nReclaimed = reclaim_logsegments(maxFreeLogsegments, sqlman, logman)
-                    logmessage = str(nReclaimed)+" log segments were reclaimed"
+                    logmessage = str(nReclaimed)+" log segments were reclaimed (-lr)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Reclaim of free logsements was not done since -lr was negative (or not specified))", logman)
                 if minRetainedDaysForHandledEvents >= 0 or minRetainedDaysForEvents >= 0:
                     nEventsCleaned = clean_events(minRetainedDaysForHandledEvents, minRetainedDaysForEvents, sqlman, logman)
-                    logmessage = str(nEventsCleaned[1])+" events were cleaned, "+str(nEventsCleaned[0])+" of those were handled. There are "+str(nEventsCleaned[2])+" events left, "+str(nEventsCleaned[3])+" of those are handled." 
+                    logmessage = str(nEventsCleaned[1])+" events were cleaned, "+str(nEventsCleaned[0])+" of those were handled. There are "+str(nEventsCleaned[2])+" events left, "+str(nEventsCleaned[3])+" of those are handled. (-eh and -eu)" 
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning of events was not done since -eh and -eu were negative (or not specified))", logman)
                 if retainedAuditLogDays != "-1":
                     nCleaned = clean_audit_logs(retainedAuditLogDays, sqlman, logman)
-                    logmessage = str(nCleaned)+" entries in the audit log table were removed"
+                    logmessage = str(nCleaned)+" entries in the audit log table were removed (-ur)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Cleaning audit logs was not done since -ur was -1 (or not specified))", logman)  
                 if pendingEmailsDays != "-1":
                     nCleaned = clean_pending_emails(pendingEmailsDays, sqlman, logman)
-                    logmessage = str(nCleaned)+" pending statistics server email notifications were removed"
+                    logmessage = str(nCleaned)+" pending statistics server email notifications were removed (-pe)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
@@ -4056,7 +4113,7 @@ def main():
                     if defragmentedPerPort:
                         for port in defragmentedPerPort:
                             if port[2] > 0:
-                                logmessage = "For Host "+str(port[0])+" and Port "+str(port[1])+" defragmentation changed by "+str(port[2])+" %"
+                                logmessage = "For Host "+str(port[0])+" and Port "+str(port[1])+" defragmentation changed by "+str(port[2])+" % (-fl)"
                                 log(logmessage, logman)
                                 emailmessage += logmessage+"\n"
                             else:
@@ -4067,7 +4124,7 @@ def main():
                     log("    (Defragmentation was not done since -fl was negative (or not specified))", logman)
                 if rcContainers:
                     nReclaimedContainers = reclaim_rs_containers(outputRcContainers, sqlman, logman)
-                    logmessage = nReclaimedContainers[1]+" row store containers were reclaimed from "+nReclaimedContainers[0]+" row store tables"
+                    logmessage = nReclaimedContainers[1]+" row store containers were reclaimed from "+nReclaimedContainers[0]+" row store tables (-rc)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
@@ -4083,15 +4140,15 @@ def main():
                 else:
                     log("    (Compression re-optimization was not done since at least one flag in each of the three compression flag groups was negative (or not specified))", logman)
                 if createVTStat:
-                    [nVTs, nVTsOptimized] = create_vt_statistics(vtSchemas, defaultVTStatType, maxRowsForDefaultVT, largeVTStatType, otherDBVTStatType, ignore2ndMon, sqlman, logman)
-                    logmessage = "Optimization statistics was created for "+str(nVTsOptimized)+" virtual tables (in total there are "+str(nVTs)+" virtual tables)" 
+                    [nVTs, nVTsOptimized] = create_vt_statistics(vtSchemas, maxColumnsOfVT, defaultVTStatType, maxRowsForDefaultVT, largeVTStatType, otherDBVTStatType, ignore2ndMon, sqlman, logman)
+                    logmessage = "Optimization statistics was created for "+str(nVTsOptimized)+" virtual tables (in total there are "+str(nVTs)+" virtual tables) (-vs)" 
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
                     log("    (Creation of optimization statistics for virtual tables was not done since -vs was false (or not specified))", logman)
                 if refreshAge > 0:
                     [nDSs, nDSsRefreshed] = refresh_statistics(vtSchemas, refreshAge, ignore2ndMon, sqlman, logman)
-                    logmessage = "Refresh of statistics was done for "+str(nDSsRefreshed)+" data statistics (in total there are "+str(nDSs)+" data statistics)" 
+                    logmessage = "Refresh of statistics was done for "+str(nDSsRefreshed)+" data statistics (in total there are "+str(nDSs)+" data statistics) (-vnr)" 
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
@@ -4103,17 +4160,17 @@ def main():
                     emailmessage += logmessage+"\n"
                 if minRetainedOutputDays >= 0:
                     nCleaned = clean_output(minRetainedOutputDays, sqlman, logman)
-                    logmessage = str(nCleaned)+" hanacleaner daily log files were removed"
+                    logmessage = str(nCleaned)+" hanacleaner daily log files were removed (-or)"
                     log(logmessage, logman)
                     emailmessage += logmessage+"\n"
                 else:
-                    log("    (Cleaning of the hanacleaner logs was not done since -or was negative (or not specified))", logman)      
-                # SEND EMAIL   (https://www.systutorials.com/5167/sending-email-using-mailx-in-linux-through-internal-smtp/):
-                if emailSender:
-                    mailstring = 'echo "'+emailmessage+'" | mailx -s "HANACleaner execution on '+SID+'('+local_dbinstance+') '+db_string+'" -S smtp=smtp://'+emailSender.mailServer+' -S from="'+emailSender.senderEmail+'" '+emailSender.recieverEmail
-                    #print mailstring
-                    subprocess.check_output(mailstring, shell=True)
-            
+                    log("    (Cleaning of the hanacleaner logs was not done since -or was negative (or not specified))", logman)  
+                ##### SEND EMAIL SUMMARY #####
+                if sendEmailSummary:
+                    sendEmail(emailmessage, logman)   
+            ################ DISABLE TIMEOUT ALARM #############
+            signal.alarm(0)
+
         # HANACLEANER INTERVALL
         if hanacleaner_interval < 0: 
             sys.exit()
